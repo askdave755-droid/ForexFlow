@@ -1,5 +1,5 @@
 """
-ForexFlow SixFilter — Spot Forex Execution + Futures Volume Brain
+ForexFlow SixFilter — Spot Forex Execution + Futures Volume Brain + COT
 Single file: main.py
 Railway: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
 Requirements: fastapi, uvicorn, requests, pydantic
@@ -37,22 +37,24 @@ OANDA_BASE = (
 )
 
 # Pair -> CME futures contract (the real-volume brain)
+# cot_invert: JPY COT is quoted in yen (long yen = short USDJPY), so invert
 PAIR_MAP = {
-    "EUR_USD": {"future": "6E", "pip": 0.0001, "atr_mult": 1.0},
-    "GBP_USD": {"future": "6B", "pip": 0.0001, "atr_mult": 1.0},
-    "USD_JPY": {"future": "6J", "pip": 0.01,   "atr_mult": 1.0},
+    "EUR_USD": {"future": "6E", "pip": 0.0001, "atr_mult": 1.0, "cot_invert": False},
+    "GBP_USD": {"future": "6B", "pip": 0.0001, "atr_mult": 1.0, "cot_invert": False},
+    "USD_JPY": {"future": "6J", "pip": 0.01,   "atr_mult": 1.0, "cot_invert": True},
 }
 
 # Session filter (UTC hours): London + NY only
-SESSIONS = [(7, 11), (12, 16)]  # 7-11 London, 12-16 NY overlap+PM
+SESSIONS = [(7, 11), (12, 16)]
 
-app = FastAPI(title="ForexFlow SixFilter", version="1.0.0")
+app = FastAPI(title="ForexFlow SevenFilter", version="2.0.0")
 
 # =============================
 # STATE
 # =============================
 STATE: Dict[str, Any] = {
-    "volume": {},          # futures volume brain: {"6E": {...}}
+    "volume": {},          # futures volume: {"6E": {...}}
+    "cot": {},             # COT positioning: {"6E": {...}}
     "daily": {"date": "", "trades": 0, "pnl": 0.0},
     "open_positions": {},
     "log": [],
@@ -184,8 +186,6 @@ def atr(candles: List[dict], period: int = 14) -> float:
 
 
 def vwap(candles: List[dict]) -> float:
-    # Session VWAP proxy on M15 candles (typical price, equal weight fallback
-    # when futures volume not yet loaded for this session window)
     num = den = 0.0
     for c in candles[-32:]:
         tp = (c["h"] + c["l"] + c["c"]) / 3
@@ -195,9 +195,9 @@ def vwap(candles: List[dict]) -> float:
 
 
 # =============================
-# SIX FILTER ENGINE (forex-adapted)
+# SEVEN FILTER ENGINE (forex-adapted)
 # =============================
-def six_filter_analyze(pair: str) -> Dict[str, Any]:
+def seven_filter_analyze(pair: str) -> Dict[str, Any]:
     cfg = PAIR_MAP[pair]
     candles = get_candles(pair, count=60, gran="M15")
     if len(candles) < 30:
@@ -213,9 +213,9 @@ def six_filter_analyze(pair: str) -> Dict[str, Any]:
 
     filters = {}
 
-    # F1 — VWAP deviation (LMSR-style mean reversion/trend gate)
+    # F1 — VWAP deviation (LMSR-style gate)
     dev = (price - vw) / a if a else 0
-    filters["vwap_dev"] = abs(dev) < 2.5  # skip over-extended
+    filters["vwap_dev"] = abs(dev) < 2.5
 
     # F2 — Trend alignment (institutional flow direction)
     if e20 > e50 and price > e20:
@@ -226,7 +226,7 @@ def six_filter_analyze(pair: str) -> Dict[str, Any]:
         direction = "NONE"
     filters["trend"] = direction != "NONE"
 
-    # F3 — Futures volume confirmation (the "real volume" brain)
+    # F3 — Futures volume confirmation (real volume brain)
     fv = STATE["volume"].get(cfg["future"], {})
     vol_ok = True
     vol_note = "no futures volume loaded — neutral"
@@ -258,8 +258,29 @@ def six_filter_analyze(pair: str) -> Dict[str, Any]:
     rr = tp_dist / sl_dist if sl_dist else 0
     filters["ev_gap"] = rr >= 2.0
 
+    # F7 — COT positioning (non-commercial/smart-money alignment)
+    cot = STATE["cot"].get(cfg["future"], {})
+    cot_ok = True
+    cot_note = "no COT loaded — neutral"
+    if cot:
+        net = cot.get("net_noncommercial", 0)
+        # For JPY: COT net long yen = bearish USD_JPY, so invert
+        if cfg["cot_invert"]:
+            net = -net
+        if direction == "LONG" and net < -20000:
+            cot_ok = False
+            cot_note = f"COT smart money heavily short ({net}) — blocks LONG"
+        elif direction == "SHORT" and net > 20000:
+            cot_ok = False
+            cot_note = f"COT smart money heavily long ({net}) — blocks SHORT"
+        else:
+            cot_note = f"COT aligned or neutral (net {net})"
+        report_date = cot.get("report_date", "unknown")
+        cot_note += f" [report {report_date}]"
+    filters["cot_positioning"] = cot_ok
+
     passed = sum(1 for v in filters.values() if v)
-    confidence = round(passed / 6 * 100, 1)
+    confidence = round(passed / 7 * 100, 1)
 
     proceed = (
         all(filters.values())
@@ -279,6 +300,7 @@ def six_filter_analyze(pair: str) -> Dict[str, Any]:
         "confidence": confidence,
         "filters": filters,
         "volume_note": vol_note,
+        "cot_note": cot_note,
         "price": round(price, 5),
         "entry": round(entry, 5),
         "stop_loss": round(sl, 5),
@@ -299,7 +321,7 @@ def calc_units(pair: str, entry: float, sl: float, balance: float) -> int:
     sl_pips = abs(entry - sl) / cfg["pip"]
     if sl_pips <= 0:
         return 0
-    pip_value = 0.10 if "JPY" not in pair else 6.5  # per 1k units approx
+    pip_value = 0.10 if "JPY" not in pair else 6.5
     units = int(risk_dollars / (sl_pips * pip_value) * 1000)
     return max(1000, min(units, 100000))
 
@@ -322,6 +344,14 @@ class VolumeUpdate(BaseModel):
     note: Optional[str] = None
 
 
+class CotUpdate(BaseModel):
+    future: str               # "6E", "6B", "6J"
+    report_date: str          # "2026-08-04"
+    noncomm_long: int
+    noncomm_short: int
+    open_interest: Optional[int] = None
+
+
 class ManualTrade(BaseModel):
     pair: str
     direction: str            # LONG or SHORT
@@ -334,6 +364,8 @@ class ManualTrade(BaseModel):
 def health():
     return {
         "status": "ok",
+        "version": "2.0.0",
+        "engine": "seven-filter",
         "oanda": {
             "env": OANDA_ENV,
             "key_set": bool(OANDA_API_KEY),
@@ -342,6 +374,7 @@ def health():
         "auto_trade": AUTO_TRADE,
         "pairs": list(PAIR_MAP.keys()),
         "volume_loaded": list(STATE["volume"].keys()),
+        "cot_loaded": list(STATE["cot"].keys()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -370,13 +403,33 @@ def volume_status():
     return STATE["volume"]
 
 
+@app.post("/cot-update")
+def cot_update(c: CotUpdate):
+    net = c.noncomm_long - c.noncomm_short
+    STATE["cot"][c.future] = {
+        "report_date": c.report_date,
+        "noncomm_long": c.noncomm_long,
+        "noncomm_short": c.noncomm_short,
+        "net_noncommercial": net,
+        "open_interest": c.open_interest,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    log_event(f"COT updated {c.future}: net {net} (report {c.report_date})")
+    return {"saved": True, "future": c.future, "net_noncommercial": net}
+
+
+@app.get("/cot-status")
+def cot_status():
+    return STATE["cot"]
+
+
 @app.get("/analyze/{pair}")
 def analyze(pair: str):
     pair = pair.upper()
     if pair not in PAIR_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
     try:
-        return six_filter_analyze(pair)
+        return seven_filter_analyze(pair)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -387,7 +440,7 @@ def scan():
     results = []
     for pair in PAIR_MAP:
         try:
-            results.append(six_filter_analyze(pair))
+            results.append(seven_filter_analyze(pair))
         except Exception as e:
             results.append({"pair": pair, "proceed": False, "reason": str(e)})
     return {
@@ -431,7 +484,7 @@ def trade(t: ManualTrade):
     pair = t.pair.upper()
     if pair not in PAIR_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    sig = six_filter_analyze(pair)
+    sig = seven_filter_analyze(pair)
     if t.direction.upper() != sig.get("direction"):
         sig["direction"] = t.direction.upper()
         sig["proceed"] = True  # manual override
@@ -465,6 +518,7 @@ def dashboard():
     return {
         "daily": STATE["daily"],
         "volume": STATE["volume"],
+        "cot": STATE["cot"],
         "recent_logs": STATE["log"][-20:],
         "config": {
             "risk_pct": RISK_PER_TRADE_PCT,
@@ -478,7 +532,7 @@ def dashboard():
 
 
 # =============================
-# BACKGROUND SCANNER (optional auto-loop)
+# BACKGROUND SCANNER
 # =============================
 def scanner_loop():
     interval = int(os.getenv("SCAN_INTERVAL_SEC", "900"))  # 15 min default
@@ -497,4 +551,4 @@ def scanner_loop():
 def startup():
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
-    log_event("ForexFlow SixFilter started")
+    log_event("ForexFlow SevenFilter started")

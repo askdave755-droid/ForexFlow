@@ -1,8 +1,9 @@
 """
-ForexFlow SixFilter — Spot Forex Execution + Futures Volume Brain + COT
+ForexFlow EightFilter — Spot Forex + Futures Volume + COT + FRED Macro
 Single file: main.py
 Railway: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
 Requirements: fastapi, uvicorn, requests, pydantic
+v2.1: Adds Filter 8 (FRED macro dollar trend), fixes JPY volume inversion
 """
 
 import os
@@ -21,12 +22,14 @@ from pydantic import BaseModel
 # =============================
 OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
-OANDA_ENV = os.getenv("OANDA_ENV", "practice")  # "practice" or "live"
+OANDA_ENV = os.getenv("OANDA_ENV", "practice")
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
 MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "65"))
+MACRO_BLOCK_PCT = float(os.getenv("MACRO_BLOCK_PCT", "0.8"))  # 5-day % move that blocks counter-trend
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -36,27 +39,41 @@ OANDA_BASE = (
     else "https://api-fxtrade.oanda.com"
 )
 
-# Pair -> CME futures contract (the real-volume brain)
-# cot_invert: JPY COT is quoted in yen (long yen = short USDJPY), so invert
+# fred_series: official daily FX rate from St. Louis Fed
+# fred_up_means: what a rising series means for the SPOT pair direction
 PAIR_MAP = {
-    "EUR_USD": {"future": "6E", "pip": 0.0001, "atr_mult": 1.0, "cot_invert": False},
-    "GBP_USD": {"future": "6B", "pip": 0.0001, "atr_mult": 1.0, "cot_invert": False},
-    "USD_JPY": {"future": "6J", "pip": 0.01,   "atr_mult": 1.0, "cot_invert": True},
+    "EUR_USD": {
+        "future": "6E", "pip": 0.0001,
+        "vol_invert": False, "cot_invert": False,
+        "fred_series": "DEXUSEU",       # USD per EUR
+        "fred_up_means": "LONG",        # rising = EUR stronger = pair up
+    },
+    "GBP_USD": {
+        "future": "6B", "pip": 0.0001,
+        "vol_invert": False, "cot_invert": False,
+        "fred_series": "DEXUSUK",       # USD per GBP
+        "fred_up_means": "LONG",
+    },
+    "USD_JPY": {
+        "future": "6J", "pip": 0.01,
+        "vol_invert": True, "cot_invert": True,
+        "fred_series": "DEXJPUS",       # JPY per USD
+        "fred_up_means": "LONG",        # rising = USD stronger = pair up
+    },
 }
 
-# Session filter (UTC hours): London + NY only
-SESSIONS = [(7, 11), (12, 16)]
+SESSIONS = [(7, 11), (12, 16)]  # UTC: London + NY
 
-app = FastAPI(title="ForexFlow SevenFilter", version="2.0.0")
+app = FastAPI(title="ForexFlow EightFilter", version="2.1.0")
 
 # =============================
 # STATE
 # =============================
 STATE: Dict[str, Any] = {
-    "volume": {},          # futures volume: {"6E": {...}}
-    "cot": {},             # COT positioning: {"6E": {...}}
+    "volume": {},
+    "cot": {},
+    "fred": {},            # {"EUR_USD": {"change_5d_pct": ..., ...}}
     "daily": {"date": "", "trades": 0, "pnl": 0.0},
-    "open_positions": {},
     "log": [],
 }
 
@@ -148,6 +165,49 @@ def place_market_order(pair: str, units: int, sl: float, tp: float):
 
 
 # =============================
+# FRED CLIENT (St. Louis Fed)
+# =============================
+def fred_series_latest(series_id: str, n: int = 8) -> List[dict]:
+    """Last n daily observations, skipping weekends/holiday gaps."""
+    if not FRED_API_KEY:
+        return []
+    url = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        f"?series_id={series_id}&api_key={FRED_API_KEY}"
+        f"&file_type=json&sort_order=desc&limit={n}"
+    )
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    obs = []
+    for o in r.json().get("observations", []):
+        if o.get("value") not in (None, ".", ""):
+            obs.append({"date": o["date"], "value": float(o["value"])})
+    return obs  # newest first
+
+
+def refresh_fred():
+    """Pull latest FRED data for all pairs, compute 5-day % change."""
+    for pair, cfg in PAIR_MAP.items():
+        try:
+            obs = fred_series_latest(cfg["fred_series"], n=8)
+            if len(obs) < 6:
+                continue
+            latest = obs[0]
+            five_back = obs[5]
+            chg = (latest["value"] - five_back["value"]) / five_back["value"] * 100
+            STATE["fred"][pair] = {
+                "series": cfg["fred_series"],
+                "latest_date": latest["date"],
+                "latest_value": latest["value"],
+                "change_5d_pct": round(chg, 3),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            log_event(f"FRED {pair} ({cfg['fred_series']}): 5d {chg:+.2f}%")
+        except Exception as e:
+            log_event(f"FRED refresh failed {pair}: {e}")
+
+
+# =============================
 # INDICATORS
 # =============================
 def ema(values: List[float], period: int) -> float:
@@ -195,9 +255,9 @@ def vwap(candles: List[dict]) -> float:
 
 
 # =============================
-# SEVEN FILTER ENGINE (forex-adapted)
+# EIGHT FILTER ENGINE
 # =============================
-def seven_filter_analyze(pair: str) -> Dict[str, Any]:
+def eight_filter_analyze(pair: str) -> Dict[str, Any]:
     cfg = PAIR_MAP[pair]
     candles = get_candles(pair, count=60, gran="M15")
     if len(candles) < 30:
@@ -213,11 +273,11 @@ def seven_filter_analyze(pair: str) -> Dict[str, Any]:
 
     filters = {}
 
-    # F1 — VWAP deviation (LMSR-style gate)
+    # F1 — VWAP deviation gate
     dev = (price - vw) / a if a else 0
     filters["vwap_dev"] = abs(dev) < 2.5
 
-    # F2 — Trend alignment (institutional flow direction)
+    # F2 — Trend alignment
     if e20 > e50 and price > e20:
         direction = "LONG"
     elif e20 < e50 and price < e20:
@@ -226,45 +286,46 @@ def seven_filter_analyze(pair: str) -> Dict[str, Any]:
         direction = "NONE"
     filters["trend"] = direction != "NONE"
 
-    # F3 — Futures volume confirmation (real volume brain)
+    # F3 — Futures volume (with JPY inversion fix)
     fv = STATE["volume"].get(cfg["future"], {})
     vol_ok = True
     vol_note = "no futures volume loaded — neutral"
     if fv:
         net = fv.get("net_change_pct", 0)
+        if cfg["vol_invert"]:
+            net = -net  # yen strength = USD_JPY weakness
         if direction == "LONG" and net < -1.5:
             vol_ok = False
-            vol_note = f"{cfg['future']} volume net {net}% bearish — blocks LONG"
+            vol_note = f"{cfg['future']} volume bearish ({net}%) — blocks LONG"
         elif direction == "SHORT" and net > 1.5:
             vol_ok = False
-            vol_note = f"{cfg['future']} volume net {net}% bullish — blocks SHORT"
+            vol_note = f"{cfg['future']} volume bullish ({net}%) — blocks SHORT"
         else:
             vol_note = f"{cfg['future']} volume confirms ({net}%)"
     filters["futures_volume"] = vol_ok
 
-    # F4 — RSI divergence / exhaustion guard
+    # F4 — RSI exhaustion guard
     filters["rsi_ok"] = not (
         (direction == "LONG" and r > 75) or (direction == "SHORT" and r < 25)
     )
 
-    # F5 — Session filter (Bayesian time-of-day edge)
+    # F5 — Session filter
     hour = datetime.now(timezone.utc).hour
     in_session = any(s <= hour < e for s, e in SESSIONS)
     filters["session"] = in_session
 
-    # F6 — EV gap: 2:1 RR minimum with ATR-scaled stops
+    # F6 — EV gap (2:1 RR with ATR stops)
     sl_dist = 1.5 * a
     tp_dist = 3.0 * a
     rr = tp_dist / sl_dist if sl_dist else 0
     filters["ev_gap"] = rr >= 2.0
 
-    # F7 — COT positioning (non-commercial/smart-money alignment)
+    # F7 — COT positioning (with JPY inversion)
     cot = STATE["cot"].get(cfg["future"], {})
     cot_ok = True
     cot_note = "no COT loaded — neutral"
     if cot:
         net = cot.get("net_noncommercial", 0)
-        # For JPY: COT net long yen = bearish USD_JPY, so invert
         if cfg["cot_invert"]:
             net = -net
         if direction == "LONG" and net < -20000:
@@ -275,12 +336,31 @@ def seven_filter_analyze(pair: str) -> Dict[str, Any]:
             cot_note = f"COT smart money heavily long ({net}) — blocks SHORT"
         else:
             cot_note = f"COT aligned or neutral (net {net})"
-        report_date = cot.get("report_date", "unknown")
-        cot_note += f" [report {report_date}]"
+        cot_note += f" [report {cot.get('report_date', '?')}]"
     filters["cot_positioning"] = cot_ok
 
+    # F8 — FRED macro dollar trend
+    fd = STATE["fred"].get(pair, {})
+    fred_ok = True
+    fred_note = "no FRED data — neutral"
+    if fd:
+        chg = fd.get("change_5d_pct", 0)
+        # rising series means "fred_up_means" direction
+        macro_dir = cfg["fred_up_means"] if chg > 0 else (
+            "SHORT" if cfg["fred_up_means"] == "LONG" else "LONG"
+        )
+        if direction != "NONE" and direction != macro_dir and abs(chg) > MACRO_BLOCK_PCT:
+            fred_ok = False
+            fred_note = (
+                f"FRED {fd.get('series')} 5d {chg:+.2f}% macro={macro_dir} "
+                f"— blocks {direction}"
+            )
+        else:
+            fred_note = f"FRED 5d {chg:+.2f}% ({fd.get('latest_date')}) — aligned/neutral"
+    filters["fred_macro"] = fred_ok
+
     passed = sum(1 for v in filters.values() if v)
-    confidence = round(passed / 7 * 100, 1)
+    confidence = round(passed / 8 * 100, 1)
 
     proceed = (
         all(filters.values())
@@ -301,6 +381,7 @@ def seven_filter_analyze(pair: str) -> Dict[str, Any]:
         "filters": filters,
         "volume_note": vol_note,
         "cot_note": cot_note,
+        "fred_note": fred_note,
         "price": round(price, 5),
         "entry": round(entry, 5),
         "stop_loss": round(sl, 5),
@@ -313,7 +394,7 @@ def seven_filter_analyze(pair: str) -> Dict[str, Any]:
 
 
 # =============================
-# SIZING (Kelly-lite)
+# SIZING
 # =============================
 def calc_units(pair: str, entry: float, sl: float, balance: float) -> int:
     cfg = PAIR_MAP[pair]
@@ -336,7 +417,7 @@ def reset_daily():
 # MODELS
 # =============================
 class VolumeUpdate(BaseModel):
-    future: str               # "6E", "6B", "6J"
+    future: str
     session_volume: Optional[int] = None
     prev_volume: Optional[int] = None
     net_change_pct: Optional[float] = None
@@ -345,8 +426,8 @@ class VolumeUpdate(BaseModel):
 
 
 class CotUpdate(BaseModel):
-    future: str               # "6E", "6B", "6J"
-    report_date: str          # "2026-08-04"
+    future: str
+    report_date: str
     noncomm_long: int
     noncomm_short: int
     open_interest: Optional[int] = None
@@ -354,7 +435,7 @@ class CotUpdate(BaseModel):
 
 class ManualTrade(BaseModel):
     pair: str
-    direction: str            # LONG or SHORT
+    direction: str
 
 
 # =============================
@@ -364,17 +445,19 @@ class ManualTrade(BaseModel):
 def health():
     return {
         "status": "ok",
-        "version": "2.0.0",
-        "engine": "seven-filter",
+        "version": "2.1.0",
+        "engine": "eight-filter",
         "oanda": {
             "env": OANDA_ENV,
             "key_set": bool(OANDA_API_KEY),
             "account_set": bool(OANDA_ACCOUNT_ID),
         },
+        "fred_key_set": bool(FRED_API_KEY),
         "auto_trade": AUTO_TRADE,
         "pairs": list(PAIR_MAP.keys()),
         "volume_loaded": list(STATE["volume"].keys()),
         "cot_loaded": list(STATE["cot"].keys()),
+        "fred_loaded": list(STATE["fred"].keys()),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -423,13 +506,26 @@ def cot_status():
     return STATE["cot"]
 
 
+@app.post("/fred-refresh")
+def fred_refresh():
+    if not FRED_API_KEY:
+        raise HTTPException(status_code=400, detail="FRED_API_KEY not set")
+    refresh_fred()
+    return {"fred": STATE["fred"]}
+
+
+@app.get("/fred-status")
+def fred_status():
+    return STATE["fred"]
+
+
 @app.get("/analyze/{pair}")
 def analyze(pair: str):
     pair = pair.upper()
     if pair not in PAIR_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
     try:
-        return seven_filter_analyze(pair)
+        return eight_filter_analyze(pair)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -440,7 +536,7 @@ def scan():
     results = []
     for pair in PAIR_MAP:
         try:
-            results.append(seven_filter_analyze(pair))
+            results.append(eight_filter_analyze(pair))
         except Exception as e:
             results.append({"pair": pair, "proceed": False, "reason": str(e)})
     return {
@@ -484,10 +580,10 @@ def trade(t: ManualTrade):
     pair = t.pair.upper()
     if pair not in PAIR_MAP:
         raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    sig = seven_filter_analyze(pair)
+    sig = eight_filter_analyze(pair)
     if t.direction.upper() != sig.get("direction"):
         sig["direction"] = t.direction.upper()
-        sig["proceed"] = True  # manual override
+        sig["proceed"] = True
     try:
         return execute_signal(sig)
     except Exception as e:
@@ -496,7 +592,6 @@ def trade(t: ManualTrade):
 
 @app.post("/auto-scan")
 def auto_scan():
-    """One-shot: scan all pairs and execute qualified signals (if AUTO_TRADE)."""
     results = scan()["results"]
     executions = []
     for sig in results:
@@ -519,12 +614,14 @@ def dashboard():
         "daily": STATE["daily"],
         "volume": STATE["volume"],
         "cot": STATE["cot"],
+        "fred": STATE["fred"],
         "recent_logs": STATE["log"][-20:],
         "config": {
             "risk_pct": RISK_PER_TRADE_PCT,
             "max_trades": MAX_TRADES_PER_DAY,
             "daily_loss_limit": DAILY_LOSS_LIMIT,
             "min_confidence": MIN_CONFIDENCE,
+            "macro_block_pct": MACRO_BLOCK_PCT,
             "auto_trade": AUTO_TRADE,
             "env": OANDA_ENV,
         },
@@ -535,10 +632,16 @@ def dashboard():
 # BACKGROUND SCANNER
 # =============================
 def scanner_loop():
-    interval = int(os.getenv("SCAN_INTERVAL_SEC", "900"))  # 15 min default
+    interval = int(os.getenv("SCAN_INTERVAL_SEC", "900"))
+    fred_counter = 0
     while True:
         time.sleep(interval)
         try:
+            # Refresh FRED macro data roughly every 8 cycles (~2h at 15min)
+            fred_counter += 1
+            if FRED_API_KEY and fred_counter >= 8:
+                fred_counter = 0
+                refresh_fred()
             if AUTO_TRADE:
                 auto_scan()
             else:
@@ -549,6 +652,11 @@ def scanner_loop():
 
 @app.on_event("startup")
 def startup():
+    if FRED_API_KEY:
+        try:
+            refresh_fred()
+        except Exception as e:
+            log_event(f"FRED startup refresh failed: {e}")
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
-    log_event("ForexFlow SevenFilter started")
+    log_event("ForexFlow EightFilter started")

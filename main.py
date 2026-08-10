@@ -1,18 +1,18 @@
 """
-ForexFlow v2.2 — OANDA Forex Auto-Trader (FIXED)
+ForexFlow v2.2 — OANDA Forex Auto-Trader (VERIFIED CLEAN)
 Fixes: FIFO open-position check | fill-counting only | one-pair-per-day | proper unit sizing
 """
 
 import os
 import logging
-from datetime import datetime, timedelta, time as dt_time
-from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime
+from typing import List, Optional, Set
 from dataclasses import dataclass, field
 from enum import Enum
 
 import requests
 import numpy as np
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
@@ -50,6 +50,7 @@ class Direction(str, Enum):
     SHORT = "SHORT"
     NONE  = "NONE"
 
+
 @dataclass
 class Candle:
     time: str
@@ -58,6 +59,7 @@ class Candle:
     low: float
     close: float
     volume: int
+
 
 @dataclass
 class Signal:
@@ -68,6 +70,7 @@ class Signal:
     confidence: float
     reason: str
     size: int = 0
+
 
 @dataclass
 class TradeState:
@@ -82,6 +85,7 @@ class TradeState:
             self.daily_fill_count = 0
             self.traded_pairs_today.clear()
             self.last_reset_date = now
+
 
 STATE = TradeState()
 
@@ -252,8 +256,10 @@ class SixFilterEngine:
         short_ok = lmsr_pass and trend_down and ev_pass and div_bear and time_pass and stoikov_pass
 
         if not (long_ok or short_ok):
-            return Signal(Direction.NONE, 0, 0, 0, 0,
-                f"Filters: LMSR={lmsr_pass}, TREND={'UP' if trend_up else 'DOWN' if trend_down else 'NONE'}, EV={ev_pass}, TIME={time_pass}")
+            return Signal(
+                Direction.NONE, 0, 0, 0, 0,
+                f"Filters: LMSR={lmsr_pass}, TREND={'UP' if trend_up else 'DOWN' if trend_down else 'NONE'}, EV={ev_pass}, TIME={time_pass}"
+            )
 
         direction = Direction.LONG if long_ok else Direction.SHORT
         entry = current_price
@@ -265,13 +271,18 @@ class SixFilterEngine:
             target = entry - target_distance
 
         confidence = 70.0
-        if lmsr_pass: confidence += 5
-        if ev_pass: confidence += 10
-        if time_pass: confidence += 5
+        if lmsr_pass:
+            confidence += 5
+        if ev_pass:
+            confidence += 10
+        if time_pass:
+            confidence += 5
         confidence = min(confidence, 95.0)
 
-        return Signal(direction, entry, stop, target, confidence,
-            f"SixFilter aligned | ATR={atr:.5f} | RSI={rsi:.1f} | VWAP={vwap:.5f}")
+        return Signal(
+            direction, entry, stop, target, confidence,
+            f"SixFilter aligned | ATR={atr:.5f} | RSI={rsi:.1f} | VWAP={vwap:.5f}"
+        )
 
 # ─── Risk Manager ─────────────────────────────────────────────────────────────
 class RiskManager:
@@ -308,16 +319,18 @@ class RiskManager:
         )
         return units
 
-# ─── FastAPI App ─────────────────────────────────────────────────────────────
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
 app = FastAPI(title="ForexFlow v2.2", version="2.2.0")
 
 client   = OandaClient()
 engine   = SixFilterEngine()
 risk_mgr = RiskManager(client)
 
+
 class TradeRequest(BaseModel):
     pair: Optional[str] = None
     direction: Optional[str] = None
+
 
 class ScanResult(BaseModel):
     pair: str
@@ -327,6 +340,7 @@ class ScanResult(BaseModel):
     executed: bool = False
     error: Optional[str] = None
 
+
 def is_trade_hours() -> bool:
     now = datetime.utcnow()
     if now.weekday() >= 5:
@@ -334,6 +348,7 @@ def is_trade_hours() -> bool:
     if now.hour in [20, 21, 22, 23]:
         return False
     return True
+
 
 @app.get("/health")
 def health():
@@ -349,6 +364,7 @@ def health():
         "pairs": PAIRS
     }
 
+
 @app.get("/status")
 def status():
     STATE.reset_if_new_day()
@@ -358,6 +374,7 @@ def status():
         "traded_pairs_today": list(STATE.traded_pairs_today),
         "open_positions": [p["instrument"] for p in client.get_open_positions()]
     }
+
 
 @app.post("/scan")
 def scan(req: TradeRequest = None) -> List[ScanResult]:
@@ -377,19 +394,24 @@ def scan(req: TradeRequest = None) -> List[ScanResult]:
         ))
     return results
 
+
 @app.post("/trade")
 def trade(req: TradeRequest = None) -> List[ScanResult]:
     STATE.reset_if_new_day()
     results: List[ScanResult] = []
 
     if not is_trade_hours():
-        return [ScanResult(pair="ALL", signal="NONE", confidence=0,
-                         reason="Outside trade hours", executed=False)]
+        return [ScanResult(
+            pair="ALL", signal="NONE", confidence=0,
+            reason="Outside trade hours", executed=False
+        )]
 
     if STATE.daily_fill_count >= MAX_DAILY_TRADES:
-        return [ScanResult(pair="ALL", signal="NONE", confidence=0,
-                         reason=f"Daily fill cap: {STATE.daily_fill_count}/{MAX_DAILY_TRADES}",
-                         executed=False)]
+        return [ScanResult(
+            pair="ALL", signal="NONE", confidence=0,
+            reason=f"Daily fill cap: {STATE.daily_fill_count}/{MAX_DAILY_TRADES}",
+            executed=False
+        )]
 
     pairs = [req.pair] if req and req.pair else PAIRS
 
@@ -463,6 +485,7 @@ def trade(req: TradeRequest = None) -> List[ScanResult]:
 
     return results
 
+
 @app.post("/trade-manual")
 def trade_manual(req: TradeRequest) -> ScanResult:
     STATE.reset_if_new_day()
@@ -471,8 +494,10 @@ def trade_manual(req: TradeRequest) -> ScanResult:
         raise HTTPException(400, "pair required")
 
     if client.has_open_position(pair):
-        return ScanResult(pair=pair, signal="BLOCKED", confidence=0,
-                         reason="FIFO: Open position exists", executed=False)
+        return ScanResult(
+            pair=pair, signal="BLOCKED", confidence=0,
+            reason="FIFO: Open position exists", executed=False
+        )
 
     candles = client.get_candles(pair, "M5", 50)
     signal = engine.analyze(candles)
@@ -482,28 +507,38 @@ def trade_manual(req: TradeRequest) -> ScanResult:
 
     units = risk_mgr.calculate_units(pair, signal.entry_price, signal.stop_price)
     if units <= 0:
-        return ScanResult(pair=pair, signal=signal.direction.value,
-                         confidence=0, reason="Zero units", executed=False)
+        return ScanResult(
+            pair=pair, signal=signal.direction.value,
+            confidence=0, reason="Zero units", executed=False
+        )
 
-    response = client.place_market_order(pair, units, signal.stop_price, signal.target_price)
+    response = client.place_market_order(
+        pair, units, signal.stop_price, signal.target_price
+    )
     order_fill = response.get("json", {}).get("orderFillTransaction")
 
     if response.get("status_code") == 201 and order_fill:
         STATE.daily_fill_count += 1
         STATE.traded_pairs_today.add(pair)
-        return ScanResult(pair=pair, signal=signal.direction.value,
-                         confidence=signal.confidence, reason="Manual override",
-                         executed=True)
+        return ScanResult(
+            pair=pair, signal=signal.direction.value,
+            confidence=signal.confidence, reason="Manual override",
+            executed=True
+        )
     else:
         reject = response.get("json", {}).get("orderRejectTransaction", {})
-        return ScanResult(pair=pair, signal=signal.direction.value,
-                         confidence=0, reason="Manual failed",
-                         executed=False, error=reject.get("rejectReason", "Unknown"))
+        return ScanResult(
+            pair=pair, signal=signal.direction.value,
+            confidence=0, reason="Manual failed",
+            executed=False, error=reject.get("rejectReason", "Unknown")
+        )
+
 
 @app.on_event("startup")
 async def startup():
     logger.info("ForexFlow v2.2 started")
     logger.info(f"Env: {OANDA_ENV} | Max Units: {MAX_UNITS:,} | Risk: {RISK_PERCENT*100}%")
+
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8080"))

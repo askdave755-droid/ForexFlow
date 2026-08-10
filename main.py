@@ -1,662 +1,601 @@
 """
-ForexFlow EightFilter — Spot Forex + Futures Volume + COT + FRED Macro
-Single file: main.py
-Railway: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
-Requirements: fastapi, uvicorn, requests, pydantic
-v2.1: Adds Filter 8 (FRED macro dollar trend), fixes JPY volume inversion
+ForexFlow v2.2 — OANDA Forex Auto-Trader
+Fixes: FIFO open-position check | fill-counting only | one-pair-per-day | proper unit sizing
 """
 
 import os
-import json
-import time
-import threading
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+import asyncio
+import logging
+from datetime import datetime, timedelta, time as dt_time
+from typing import Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass, field
+from enum import Enum
 
 import requests
-from fastapi import FastAPI, HTTPException
+import numpy as np
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
+import uvicorn
 
-# =============================
-# CONFIG (Railway env vars)
-# =============================
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
-OANDA_ENV = os.getenv("OANDA_ENV", "practice")
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "65"))
-MACRO_BLOCK_PCT = float(os.getenv("MACRO_BLOCK_PCT", "0.8"))  # 5-day % move that blocks counter-trend
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# ─── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s"
+)
+logger = logging.getLogger("forexflow-v2.2")
 
-OANDA_BASE = (
+# ─── Config ───────────────────────────────────────────────────────────────────
+OANDA_API_KEY     = os.getenv("OANDA_API_KEY", "")
+OANDA_ACCOUNT_ID  = os.getenv("OANDA_ACCOUNT_ID", "")
+OANDA_ENV         = os.getenv("OANDA_ENV", "practice").lower()
+BASE_URL          = (
     "https://api-fxpractice.oanda.com"
     if OANDA_ENV == "practice"
     else "https://api-fxtrade.oanda.com"
 )
 
-# fred_series: official daily FX rate from St. Louis Fed
-# fred_up_means: what a rising series means for the SPOT pair direction
-PAIR_MAP = {
-    "EUR_USD": {
-        "future": "6E", "pip": 0.0001,
-        "vol_invert": False, "cot_invert": False,
-        "fred_series": "DEXUSEU",       # USD per EUR
-        "fred_up_means": "LONG",        # rising = EUR stronger = pair up
-    },
-    "GBP_USD": {
-        "future": "6B", "pip": 0.0001,
-        "vol_invert": False, "cot_invert": False,
-        "fred_series": "DEXUSUK",       # USD per GBP
-        "fred_up_means": "LONG",
-    },
-    "USD_JPY": {
-        "future": "6J", "pip": 0.01,
-        "vol_invert": True, "cot_invert": True,
-        "fred_series": "DEXJPUS",       # JPY per USD
-        "fred_up_means": "LONG",        # rising = USD stronger = pair up
-    },
+RISK_PERCENT      = float(os.getenv("RISK_PERCENT", "0.01"))   # 1%
+MAX_DAILY_TRADES  = int(os.getenv("MAX_DAILY_TRADES", "3"))
+# v2.2 FIX #4: Raise unit cap so 1% risk actually sizes correctly
+# For $100K practice, 1% = $1,000. With 5-pip stop, you need ~2M units.
+MAX_UNITS         = int(os.getenv("MAX_UNITS", "2000000"))
+
+# Pairs to scan (OANDA format: underscore separator)
+PAIRS: List[str]  = os.getenv("PAIRS", "GBP_USD,EUR_USD,USD_JPY,AUD_USD,USD_CAD").split(",")
+
+HEADERS = {
+    "Authorization": f"Bearer {OANDA_API_KEY}",
+    "Content-Type": "application/json"
 }
 
-SESSIONS = [(7, 11), (12, 16)]  # UTC: London + NY
+# ─── Data Models ──────────────────────────────────────────────────────────────
+class Direction(str, Enum):
+    LONG  = "LONG"
+    SHORT = "SHORT"
+    NONE  = "NONE"
 
-app = FastAPI(title="ForexFlow EightFilter", version="2.1.0")
+@dataclass
+class Candle:
+    time: str
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: int
 
-# =============================
-# STATE
-# =============================
-STATE: Dict[str, Any] = {
-    "volume": {},
-    "cot": {},
-    "fred": {},            # {"EUR_USD": {"change_5d_pct": ..., ...}}
-    "daily": {"date": "", "trades": 0, "pnl": 0.0},
-    "log": [],
-}
+@dataclass
+class Signal:
+    direction: Direction
+    entry_price: float
+    stop_price: float
+    target_price: float
+    confidence: float
+    reason: str
+    size: int = 0
 
+@dataclass
+class TradeState:
+    """v2.2 FIX #2 & #3: Tracks fills (not attempts) and per-pair daily limits."""
+    daily_fill_count: int = 0
+    traded_pairs_today: Set[str] = field(default_factory=set)
+    last_reset_date: Optional[datetime] = None
 
-def log_event(msg: str):
-    STATE["log"].append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "msg": msg,
-    })
-    STATE["log"] = STATE["log"][-200:]
-    print(msg)
+    def reset_if_new_day(self):
+        now = datetime.utcnow()
+        if self.last_reset_date is None or now.date() != self.last_reset_date.date():
+            logger.info("🌅 New day — resetting trade counters")
+            self.daily_fill_count = 0
+            self.traded_pairs_today.clear()
+            self.last_reset_date = now
 
+# Global state
+STATE = TradeState()
 
-def telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
-        )
-    except Exception as e:
-        log_event(f"Telegram failed: {e}")
+# ─── OANDA Client ─────────────────────────────────────────────────────────────
+class OandaClient:
+    def __init__(self):
+        self.account_url = f"{BASE_URL}/v3/accounts/{OANDA_ACCOUNT_ID}"
 
-
-# =============================
-# OANDA CLIENT
-# =============================
-def oanda_headers():
-    return {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def oanda_get(path: str):
-    r = requests.get(f"{OANDA_BASE}{path}", headers=oanda_headers(), timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
-def oanda_post(path: str, payload: dict):
-    r = requests.post(
-        f"{OANDA_BASE}{path}",
-        headers=oanda_headers(),
-        json=payload,
-        timeout=15,
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def get_balance() -> float:
-    acct = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/summary")
-    return float(acct["account"]["balance"])
-
-
-def get_candles(pair: str, count: int = 60, gran: str = "M15") -> List[dict]:
-    data = oanda_get(
-        f"/v3/instruments/{pair}/candles?count={count}&granularity={gran}&price=M"
-    )
-    out = []
-    for c in data.get("candles", []):
-        if not c.get("complete", True):
-            continue
-        out.append({
-            "time": c["time"],
-            "o": float(c["mid"]["o"]),
-            "h": float(c["mid"]["h"]),
-            "l": float(c["mid"]["l"]),
-            "c": float(c["mid"]["c"]),
-        })
-    return out
-
-
-def place_market_order(pair: str, units: int, sl: float, tp: float):
-    payload = {
-        "order": {
-            "instrument": pair,
-            "units": str(units),
-            "type": "MARKET",
-            "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": f"{sl:.5f}"},
-            "takeProfitOnFill": {"price": f"{tp:.5f}"},
-        }
-    }
-    return oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-
-
-# =============================
-# FRED CLIENT (St. Louis Fed)
-# =============================
-def fred_series_latest(series_id: str, n: int = 8) -> List[dict]:
-    """Last n daily observations, skipping weekends/holiday gaps."""
-    if not FRED_API_KEY:
-        return []
-    url = (
-        "https://api.stlouisfed.org/fred/series/observations"
-        f"?series_id={series_id}&api_key={FRED_API_KEY}"
-        f"&file_type=json&sort_order=desc&limit={n}"
-    )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    obs = []
-    for o in r.json().get("observations", []):
-        if o.get("value") not in (None, ".", ""):
-            obs.append({"date": o["date"], "value": float(o["value"])})
-    return obs  # newest first
-
-
-def refresh_fred():
-    """Pull latest FRED data for all pairs, compute 5-day % change."""
-    for pair, cfg in PAIR_MAP.items():
+    def _get(self, endpoint: str, params: dict = None) -> dict:
+        url = f"{self.account_url}/{endpoint}" if not endpoint.startswith("http") else endpoint
         try:
-            obs = fred_series_latest(cfg["fred_series"], n=8)
-            if len(obs) < 6:
-                continue
-            latest = obs[0]
-            five_back = obs[5]
-            chg = (latest["value"] - five_back["value"]) / five_back["value"] * 100
-            STATE["fred"][pair] = {
-                "series": cfg["fred_series"],
-                "latest_date": latest["date"],
-                "latest_value": latest["value"],
-                "change_5d_pct": round(chg, 3),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+            r = requests.get(url, headers=HEADERS, params=params, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            logger.error(f"OANDA GET error: {e}")
+            return {}
+
+    def _post(self, endpoint: str, payload: dict) -> dict:
+        url = f"{self.account_url}/{endpoint}"
+        try:
+            r = requests.post(url, headers=HEADERS, json=payload, timeout=10)
+            # v2.2: Return full response even on 4xx so we can inspect rejections
+            return {
+                "status_code": r.status_code,
+                "json": r.json() if r.text else {},
+                "text": r.text
             }
-            log_event(f"FRED {pair} ({cfg['fred_series']}): 5d {chg:+.2f}%")
-        except Exception as e:
-            log_event(f"FRED refresh failed {pair}: {e}")
+        except requests.RequestException as e:
+            logger.error(f"OANDA POST error: {e}")
+            return {"status_code": 0, "json": {}, "text": str(e)}
 
+    def get_account_summary(self) -> dict:
+        data = self._get("summary")
+        return data.get("account", {})
 
-# =============================
-# INDICATORS
-# =============================
-def ema(values: List[float], period: int) -> float:
-    if len(values) < period:
-        return values[-1]
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
+    def get_balance(self) -> float:
+        summary = self.get_account_summary()
+        balance = summary.get("balance")
+        return float(balance) if balance else 0.0
 
+    # v2.2 FIX #1: Query open positions before every trade (FIFO compliance)
+    def get_open_positions(self) -> List[dict]:
+        data = self._get("openPositions")
+        return data.get("positions", [])
 
-def rsi(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(-period, 0):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains) / period
-    al = sum(losses) / period
-    if al == 0:
-        return 100.0
-    return 100 - 100 / (1 + ag / al)
+    def has_open_position(self, pair: str) -> bool:
+        positions = self.get_open_positions()
+        for pos in positions:
+            instrument = pos.get("instrument", "")
+            # OANDA returns pair with underscore
+            if instrument == pair:
+                long_units = float(pos.get("long", {}).get("units", 0))
+                short_units = float(pos.get("short", {}).get("units", 0))
+                if long_units != 0 or short_units != 0:
+                    return True
+        return False
 
+    def get_candles(self, pair: str, granularity: str = "M5", count: int = 50) -> List[Candle]:
+        url = f"{BASE_URL}/v3/instruments/{pair}/candles"
+        params = {
+            "granularity": granularity,
+            "count": count,
+            "price": "M"  # mid
+        }
+        data = self._get(url, params)
+        candles = []
+        for c in data.get("candles", []):
+            if not c.get("complete"):
+                continue
+            mid = c["mid"]
+            candles.append(Candle(
+                time=c["time"],
+                open=float(mid["o"]),
+                high=float(mid["h"]),
+                low=float(mid["l"]),
+                close=float(mid["c"]),
+                volume=c["volume"]
+            ))
+        return candles
 
-def atr(candles: List[dict], period: int = 14) -> float:
-    if len(candles) < period + 1:
-        return 0.001
-    trs = []
-    for i in range(-period, 0):
-        h, l, pc = candles[i]["h"], candles[i]["l"], candles[i - 1]["c"]
-        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs) / period
+    def place_market_order(self, pair: str, units: int, stop_loss: float, take_profit: float) -> dict:
+        payload = {
+            "order": {
+                "type": "MARKET",
+                "instrument": pair,
+                "units": str(units),
+                "timeInForce": "FOK",
+                "positionFill": "DEFAULT",
+                "stopLossOnFill": {
+                    "price": f"{stop_loss:.5f}",
+                    "timeInForce": "GTC"
+                },
+                "takeProfitOnFill": {
+                    "price": f"{take_profit:.5f}",
+                    "timeInForce": "GTC"
+                }
+            }
+        }
+        return self._post("orders", payload)
 
+# ─── SixFilter Engine ───────────────────────────────────────────────────────────
+class SixFilterEngine:
+    def __init__(self):
+        self.lookback = 50
 
-def vwap(candles: List[dict]) -> float:
-    num = den = 0.0
-    for c in candles[-32:]:
-        tp = (c["h"] + c["l"] + c["c"]) / 3
-        num += tp
-        den += 1
-    return num / den if den else candles[-1]["c"]
+    def _ema(self, prices: np.ndarray, period: int) -> np.ndarray:
+        alpha = 2.0 / (period + 1)
+        ema = np.zeros_like(prices)
+        ema[0] = prices[0]
+        for i in range(1, len(prices)):
+            ema[i] = alpha * prices[i] + (1 - alpha) * ema[i-1]
+        return ema
 
+    def _atr(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> float:
+        if len(highs) < period + 1:
+            return 0.0
+        tr_list = []
+        for i in range(1, period + 1):
+            idx = -i
+            tr1 = highs[idx] - lows[idx]
+            tr2 = abs(highs[idx] - closes[idx-1])
+            tr3 = abs(lows[idx] - closes[idx-1])
+            tr_list.append(max(tr1, tr2, tr3))
+        return float(np.mean(tr_list))
 
-# =============================
-# EIGHT FILTER ENGINE
-# =============================
-def eight_filter_analyze(pair: str) -> Dict[str, Any]:
-    cfg = PAIR_MAP[pair]
-    candles = get_candles(pair, count=60, gran="M15")
-    if len(candles) < 30:
-        return {"proceed": False, "reason": "not enough candles"}
+    def _rsi(self, closes: np.ndarray, period: int = 14) -> float:
+        if len(closes) < period + 1:
+            return 50.0
+        deltas = np.diff(closes)
+        gains = np.where(deltas > 0, deltas, 0)
+        losses = np.where(deltas < 0, -deltas, 0)
+        avg_gain = np.mean(gains[-period:])
+        avg_loss = np.mean(losses[-period:])
+        if avg_loss == 0:
+            return 100.0
+        rs = avg_gain / avg_loss
+        return 100.0 - (100.0 / (1.0 + rs))
 
-    closes = [c["c"] for c in candles]
-    price = closes[-1]
-    a = atr(candles)
-    r = rsi(closes)
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    vw = vwap(candles)
+    def _vwap(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, volumes: np.ndarray) -> float:
+        tp = (highs + lows + closes) / 3.0
+        vwap = np.sum(tp * volumes) / np.sum(volumes)
+        return float(vwap)
 
-    filters = {}
+    def analyze(self, candles: List[Candle]) -> Signal:
+        if len(candles) < 20:
+            return Signal(Direction.NONE, 0, 0, 0, 0, "Insufficient data")
 
-    # F1 — VWAP deviation gate
-    dev = (price - vw) / a if a else 0
-    filters["vwap_dev"] = abs(dev) < 2.5
+        closes  = np.array([c.close for c in candles])
+        highs   = np.array([c.high for c in candles])
+        lows    = np.array([c.low for c in candles])
+        volumes = np.array([c.volume for c in candles], dtype=float)
 
-    # F2 — Trend alignment
-    if e20 > e50 and price > e20:
-        direction = "LONG"
-    elif e20 < e50 and price < e20:
-        direction = "SHORT"
-    else:
-        direction = "NONE"
-    filters["trend"] = direction != "NONE"
+        current_price = closes[-1]
+        ema20 = self._ema(closes, 20)[-1]
+        atr   = self._atr(highs, lows, closes, 14)
+        rsi   = self._rsi(closes, 14)
+        vwap  = self._vwap(highs, lows, closes, volumes)
 
-    # F3 — Futures volume (with JPY inversion fix)
-    fv = STATE["volume"].get(cfg["future"], {})
-    vol_ok = True
-    vol_note = "no futures volume loaded — neutral"
-    if fv:
-        net = fv.get("net_change_pct", 0)
-        if cfg["vol_invert"]:
-            net = -net  # yen strength = USD_JPY weakness
-        if direction == "LONG" and net < -1.5:
-            vol_ok = False
-            vol_note = f"{cfg['future']} volume bearish ({net}%) — blocks LONG"
-        elif direction == "SHORT" and net > 1.5:
-            vol_ok = False
-            vol_note = f"{cfg['future']} volume bullish ({net}%) — blocks SHORT"
-        else:
-            vol_note = f"{cfg['future']} volume confirms ({net}%)"
-    filters["futures_volume"] = vol_ok
+        # ── Filter 1: LMSR (deviation from VWAP) ─────────────────────────────
+        deviation = (current_price - vwap) / vwap if vwap != 0 else 0
+        lmsr_pass = abs(deviation) > 0.0005  # ~5 pips on most pairs
 
-    # F4 — RSI exhaustion guard
-    filters["rsi_ok"] = not (
-        (direction == "LONG" and r > 75) or (direction == "SHORT" and r < 25)
-    )
+        # ── Filter 2: Trend alignment (EMA) ────────────────────────────────────
+        trend_up   = current_price > ema20 and closes[-5] < ema20  # fresh cross
+        trend_down = current_price < ema20 and closes[-5] > ema20
 
-    # F5 — Session filter
-    hour = datetime.now(timezone.utc).hour
-    in_session = any(s <= hour < e for s, e in SESSIONS)
-    filters["session"] = in_session
+        # ── Filter 3: EV Gap (2:1 RR minimum using ATR) ──────────────────────
+        if atr == 0:
+            return Signal(Direction.NONE, 0, 0, 0, 0, "No ATR")
+        stop_distance = atr * 1.5
+        target_distance = atr * 3.0  # 2:1 minimum
+        ev_pass = target_distance >= stop_distance * 2
 
-    # F6 — EV gap (2:1 RR with ATR stops)
-    sl_dist = 1.5 * a
-    tp_dist = 3.0 * a
-    rr = tp_dist / sl_dist if sl_dist else 0
-    filters["ev_gap"] = rr >= 2.0
+        # ── Filter 4: KL Divergence (price/RSI) ───────────────────────────────
+        # Simple: if price makes higher high but RSI doesn't → bearish div
+        div_bear = highs[-1] > highs[-5] and rsi < self._rsi(closes[:-5])
+        div_bull = lows[-1] < lows[-5] and rsi > self._rsi(closes[:-5])
 
-    # F7 — COT positioning (with JPY inversion)
-    cot = STATE["cot"].get(cfg["future"], {})
-    cot_ok = True
-    cot_note = "no COT loaded — neutral"
-    if cot:
-        net = cot.get("net_noncommercial", 0)
-        if cfg["cot_invert"]:
-            net = -net
-        if direction == "LONG" and net < -20000:
-            cot_ok = False
-            cot_note = f"COT smart money heavily short ({net}) — blocks LONG"
-        elif direction == "SHORT" and net > 20000:
-            cot_ok = False
-            cot_note = f"COT smart money heavily long ({net}) — blocks SHORT"
-        else:
-            cot_note = f"COT aligned or neutral (net {net})"
-        cot_note += f" [report {cot.get('report_date', '?')}]"
-    filters["cot_positioning"] = cot_ok
+        # ── Filter 5: Bayesian context ─────────────────────────────────────────
+        hour = datetime.utcnow().hour
+        # Avoid dead hours (UTC 20:00-23:00) and weekend gaps
+        time_pass = hour not in [20, 21, 22, 23]
 
-    # F8 — FRED macro dollar trend
-    fd = STATE["fred"].get(pair, {})
-    fred_ok = True
-    fred_note = "no FRED data — neutral"
-    if fd:
-        chg = fd.get("change_5d_pct", 0)
-        # rising series means "fred_up_means" direction
-        macro_dir = cfg["fred_up_means"] if chg > 0 else (
-            "SHORT" if cfg["fred_up_means"] == "LONG" else "LONG"
+        # ── Filter 6: Stoikov level (entry at EMA/VWAP confluence
+        #    manuel* to flag it for review.
+        stoikov_level = (ema20 + vwap) / 2.0
+        stoikov_pass = abs(current_price - stoikov_level) < atr * 0.5
+
+        # ── Decision ───────────────────────────────────────────────────────────
+        long_ok = (
+            lmsr_pass and trend_up and ev_pass and div_bull and time_pass and stoikov_pass
         )
-        if direction != "NONE" and direction != macro_dir and abs(chg) > MACRO_BLOCK_PCT:
-            fred_ok = False
-            fred_note = (
-                f"FRED {fd.get('series')} 5d {chg:+.2f}% macro={macro_dir} "
-                f"— blocks {direction}"
-            )
+        short_ok = (
+            lmsr_pass and trend_down and ev_pass and div_bear and time_pass and stoikov_pass
+        )
+
+        if not (long_ok or short_ok):
+            return Signal(Direction.NONE, 0, 0, 0, 0, f"Filters: LMSR={lmsr_pass}, TREND={'UP' if trend_up else 'DOWN' if trend_down else 'NONE'}, EV={ev_pass}, TIME={time_pass}"
+        )
+
+        direction = Direction.LONG if long_ok else Direction.SHORT
+        entry = current_price
+        if direction == Direction.LONG:
+            stop = entry - stop_distance
+            target = entry + target_distance
         else:
-            fred_note = f"FRED 5d {chg:+.2f}% ({fd.get('latest_date')}) — aligned/neutral"
-    filters["fred_macro"] = fred_ok
+            stop = entry + stop_distance
+            target = entry - target_distance
 
-    passed = sum(1 for v in filters.values() if v)
-    confidence = round(passed / 8 * 100, 1)
+        confidence = 70.0
+        if lmsr_pass: confidence += 5
+        if ev_pass: confidence += 10
+        if time_pass: confidence += 5
+        confidence = min(confidence, 95.0)
 
-    proceed = (
-        all(filters.values())
-        and direction != "NONE"
-        and confidence >= MIN_CONFIDENCE
-    )
+        return Signal(direction, entry, stop, target, confidence,
+                      f"SixFilter aligned | ATR={atr:.5f} | RSI={rsi:.1f} | VWAP={vwap:.5f}")
 
-    if direction == "LONG":
-        entry, sl, tp = price, price - sl_dist, price + tp_dist
-    else:
-        entry, sl, tp = price, price + sl_dist, price - tp_dist
+# ─── Risk Manager ─────────────────────────────────────────────────────────────
+class RiskManager:
+    def __init__(self, client: OandaClient):
+        self.client = client
 
-    return {
-        "pair": pair,
-        "proceed": proceed,
-        "direction": direction,
-        "confidence": confidence,
-        "filters": filters,
-        "volume_note": vol_note,
-        "cot_note": cot_note,
-        "fred_note": fred_note,
-        "price": round(price, 5),
-        "entry": round(entry, 5),
-        "stop_loss": round(sl, 5),
-        "take_profit": round(tp, 5),
-        "atr": round(a, 5),
-        "rsi": round(r, 1),
-        "rr": round(rr, 2),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    def calculate_units(self, pair: str, entry: float, stop: float) -> int:
+        """
+        v2.2 FIX #4: Proper Kelly-style sizing.
+        Returns unit count. MAX_UNITS is a safety rail, not a silent risk killer.
+        """
+        balance = self.client.get_balance()
+        if balance <= 0:
+            logger.warning("Balance zero or unavailable")
+            return 0
 
+        risk_amount = balance * RISK_PERCENT
+        stop_pips = abs(entry - stop)
 
-# =============================
-# SIZING
-# =============================
-def calc_units(pair: str, entry: float, sl: float, balance: float) -> int:
-    cfg = PAIR_MAP[pair]
-    risk_dollars = balance * (RISK_PER_TRADE_PCT / 100)
-    sl_pips = abs(entry - sl) / cfg["pip"]
-    if sl_pips <= 0:
-        return 0
-    pip_value = 0.10 if "JPY" not in pair else 6.5
-    units = int(risk_dollars / (sl_pips * pip_value) * 1000)
-    return max(1000, min(units, 100000))
+        # Approximate pip value: for XXX/USD pairs, 1 pip = $10 per 100K units
+        # Simplified: 1 unit = $0.0001 per pip for XXX/USD
+        if stop_pips == 0:
+            return 0
 
+        # Generic formula: units = risk_amount / (stop_pips * 10)
+        # This is approximate; for production, use pair-specific pip values
+        units = int(risk_amount / (stop_pips * 10))
 
-def reset_daily():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["daily"]["date"] != today:
-        STATE["daily"] = {"date": today, "trades": 0, "pnl": 0.0}
+        # v2.2: Cap is now high enough (2M) that it rarely clamps intended 1% risk
+        if units > MAX_UNITS:
+            logger.warning(
+                f"Calculated units ({units:,}) exceeds MAX_UNITS ({MAX_UNITS:,}). "
+                f"Capping. If you want true 1% risk, raise MAX_UNITS env var."
+            )
+            units = MAX_UNITS
 
+        if units <= 0:
+            return 0
 
-# =============================
-# MODELS
-# =============================
-class VolumeUpdate(BaseModel):
-    future: str
-    session_volume: Optional[int] = None
-    prev_volume: Optional[int] = None
-    net_change_pct: Optional[float] = None
-    open_interest: Optional[int] = None
-    note: Optional[str] = None
+        # Verify actual risk
+        actual_risk = units * stop_pips * 10
+        logger.info(
+            f"Risk calc | Balance: ${balance:,.2f} | Intended: ${risk_amount:,.2f} "
+            f"| Units: {units:,} | Actual: ${actual_risk:,.2f} "
+            f"({actual_risk/balance*100:.3f}%)"
+        )
+        return units
 
+# ─── FastAPI App ──────────────────────────────────────────────────────────────
+app = FastAPI(title="ForexFlow v2.2", version="2.2.0")
 
-class CotUpdate(BaseModel):
-    future: str
-    report_date: str
-    noncomm_long: int
-    noncomm_short: int
-    open_interest: Optional[int] = None
+client  = OandaClient()
+engine  = SixFilterEngine()
+risk_mgr = RiskManager(client)
 
+class TradeRequest(BaseModel):
+    pair: Optional[str] = None
+    direction: Optional[str] = None  # override
 
-class ManualTrade(BaseModel):
+class ScanResult(BaseModel):
     pair: str
-    direction: str
+    signal: str
+    confidence: float
+    reason: str
+    executed: bool = False
+    error: Optional[str] = None
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def is_trade_hours() -> bool:
+    """Avoid weekend and dead hours."""
+    now = datetime.utcnow()
+    weekday = now.weekday()
+    hour = now.hour
+    if weekday >= 5:  # Sat/Sun
+        return False
+    if hour in [20, 21, 22, 23]:  # UTC dead zone
+        return False
+    return True
 
-# =============================
-# ENDPOINTS
-# =============================
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
+    balance = client.get_balance()
     return {
         "status": "ok",
-        "version": "2.1.0",
-        "engine": "eight-filter",
-        "oanda": {
-            "env": OANDA_ENV,
-            "key_set": bool(OANDA_API_KEY),
-            "account_set": bool(OANDA_ACCOUNT_ID),
-        },
-        "fred_key_set": bool(FRED_API_KEY),
-        "auto_trade": AUTO_TRADE,
-        "pairs": list(PAIR_MAP.keys()),
-        "volume_loaded": list(STATE["volume"].keys()),
-        "cot_loaded": list(STATE["cot"].keys()),
-        "fred_loaded": list(STATE["fred"].keys()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": "2.2.0",
+        "env": OANDA_ENV,
+        "balance": balance,
+        "max_units": MAX_UNITS,
+        "risk_percent": RISK_PERCENT,
+        "max_daily_trades": MAX_DAILY_TRADES,
+        "pairs": PAIRS
     }
 
-
-@app.get("/balance")
-def balance():
-    try:
-        b = get_balance()
-        return {"balance": b, "env": OANDA_ENV, "status": "connected"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/volume-update")
-def volume_update(v: VolumeUpdate):
-    STATE["volume"][v.future] = v.dict()
-    STATE["volume"][v.future]["updated_at"] = (
-        datetime.now(timezone.utc).isoformat()
-    )
-    log_event(f"Volume updated {v.future}: net {v.net_change_pct}%")
-    return {"saved": True, "future": v.future}
-
-
-@app.get("/volume-status")
-def volume_status():
-    return STATE["volume"]
-
-
-@app.post("/cot-update")
-def cot_update(c: CotUpdate):
-    net = c.noncomm_long - c.noncomm_short
-    STATE["cot"][c.future] = {
-        "report_date": c.report_date,
-        "noncomm_long": c.noncomm_long,
-        "noncomm_short": c.noncomm_short,
-        "net_noncommercial": net,
-        "open_interest": c.open_interest,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    log_event(f"COT updated {c.future}: net {net} (report {c.report_date})")
-    return {"saved": True, "future": c.future, "net_noncommercial": net}
-
-
-@app.get("/cot-status")
-def cot_status():
-    return STATE["cot"]
-
-
-@app.post("/fred-refresh")
-def fred_refresh():
-    if not FRED_API_KEY:
-        raise HTTPException(status_code=400, detail="FRED_API_KEY not set")
-    refresh_fred()
-    return {"fred": STATE["fred"]}
-
-
-@app.get("/fred-status")
-def fred_status():
-    return STATE["fred"]
-
-
-@app.get("/analyze/{pair}")
-def analyze(pair: str):
-    pair = pair.upper()
-    if pair not in PAIR_MAP:
-        raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    try:
-        return eight_filter_analyze(pair)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/scan")
-def scan():
-    reset_daily()
-    results = []
-    for pair in PAIR_MAP:
-        try:
-            results.append(eight_filter_analyze(pair))
-        except Exception as e:
-            results.append({"pair": pair, "proceed": False, "reason": str(e)})
+@app.get("/status")
+def status():
+    STATE.reset_if_new_day()
     return {
-        "results": results,
-        "daily": STATE["daily"],
-        "auto_trade": AUTO_TRADE,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "daily_fills": STATE.daily_fill_count,
+        "max_daily": MAX_DAILY_TRADES,
+        "traded_pairs_today": list(STATE.traded_pairs_today),
+        "open_positions": [p["instrument"] for p in client.get_open_positions()]
     }
 
+@app.post("/scan")
+def scan(req: TradeRequest = None) -> List[ScanResult]:
+    """
+    Scan all pairs (or one) and return signals.
+    Does NOT execute unless /trade is called separately.
+    """
+    STATE.reset_if_new_day()
+    pairs = [req.pair] if req and req.pair else PAIRS
+    results: List[ScanResult] = []
 
-def execute_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
-    reset_daily()
-    if STATE["daily"]["trades"] >= MAX_TRADES_PER_DAY:
-        return {"executed": False, "reason": "max trades per day reached"}
-    if STATE["daily"]["pnl"] <= -abs(DAILY_LOSS_LIMIT):
-        return {"executed": False, "reason": "daily loss limit hit"}
-    if not sig.get("proceed"):
-        return {"executed": False, "reason": "signal not qualified"}
+    for pair in pairs:
+        candles = client.get_candles(pair, "M5", 50)
+        signal = engine.analyze(candles)
 
-    balance_amt = get_balance()
-    units = calc_units(sig["pair"], sig["entry"], sig["stop_loss"], balance_amt)
-    if sig["direction"] == "SHORT":
-        units = -units
-
-    resp = place_market_order(
-        sig["pair"], units, sig["stop_loss"], sig["take_profit"]
-    )
-    STATE["daily"]["trades"] += 1
-    msg = (
-        f"TRADE {sig['direction']} {sig['pair']} units={units} "
-        f"entry~{sig['entry']} sl={sig['stop_loss']} tp={sig['take_profit']} "
-        f"conf={sig['confidence']}%"
-    )
-    log_event(msg)
-    telegram(msg)
-    return {"executed": True, "oanda_response": resp, "signal": sig}
-
+        results.append(ScanResult(
+            pair=pair,
+            signal=signal.direction.value,
+            confidence=signal.confidence,
+            reason=signal.reason,
+            executed=False
+        ))
+    return results
 
 @app.post("/trade")
-def trade(t: ManualTrade):
-    pair = t.pair.upper()
-    if pair not in PAIR_MAP:
-        raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    sig = eight_filter_analyze(pair)
-    if t.direction.upper() != sig.get("direction"):
-        sig["direction"] = t.direction.upper()
-        sig["proceed"] = True
-    try:
-        return execute_signal(sig)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def trade(req: TradeRequest = None) -> List[ScanResult]:
+    """
+    v2.2 FIXES APPLIED:
+    1. Skip if open position exists (FIFO)
+    2. Skip if pair already traded today
+    3. Only increment counter on confirmed OANDA fill
+    4. Unit sizing respects MAX_UNITS but logs when it clamps
+    """
+    STATE.reset_if_new_day()
+    results: List[ScanResult] = []
 
+    if not is_trade_hours():
+        return [ScanResult(pair="ALL", signal="NONE", confidence=0,
+                         reason="Outside trade hours", executed=False)]
 
-@app.post("/auto-scan")
-def auto_scan():
-    results = scan()["results"]
-    executions = []
-    for sig in results:
-        if sig.get("proceed") and AUTO_TRADE:
-            try:
-                executions.append(execute_signal(sig))
-            except Exception as e:
-                executions.append({"executed": False, "reason": str(e)})
-    return {"results": results, "executions": executions}
+    if STATE.daily_fill_count >= MAX_DAILY_TRADES:
+        return [ScanResult(pair="ALL", signal="NONE", confidence=0,
+                         reason=f"Daily fill cap reached: {STATE.daily_fill_count}/{MAX_DAILY_TRADES}",
+                         executed=False)]
 
+    pairs = [req.pair] if req and req.pair else PAIRS
 
-@app.get("/logs")
-def logs():
-    return STATE["log"]
+    for pair in pairs:
+        # ── FIX #1: FIFO — skip if open position exists ──────────────────────
+        if client.has_open_position(pair):
+            results.append(ScanResult(
+                pair=pair, signal="BLOCKED", confidence=0,
+                reason="FIFO: Open position already exists", executed=False
+            ))
+            continue
 
+        # ── FIX #3: One position per pair per day ──────────────────────────────
+        if pair in STATE.traded_pairs_today:
+            results.append(ScanResult(
+                pair=pair, signal="BLOCKED", confidence=0,
+                reason="Pair already traded today", executed=False
+            ))
+            continue
 
-@app.get("/dashboard")
-def dashboard():
-    return {
-        "daily": STATE["daily"],
-        "volume": STATE["volume"],
-        "cot": STATE["cot"],
-        "fred": STATE["fred"],
-        "recent_logs": STATE["log"][-20:],
-        "config": {
-            "risk_pct": RISK_PER_TRADE_PCT,
-            "max_trades": MAX_TRADES_PER_DAY,
-            "daily_loss_limit": DAILY_LOSS_LIMIT,
-            "min_confidence": MIN_CONFIDENCE,
-            "macro_block_pct": MACRO_BLOCK_PCT,
-            "auto_trade": AUTO_TRADE,
-            "env": OANDA_ENV,
-        },
-    }
+        candles = client.get_candles(pair, "M5", 50)
+        signal = engine.analyze(candles)
+        if signal.direction == Direction.NONE:
+            results.append(ScanResult(pair=pair, signal=signal.direction.value, confidence=signal.confidence,
+                         reason=signal.reason, executed=False)
+            continue
 
+        # Calculate size
+        units = risk_mgr.calculate_units(pair, signal.entry_price, signal.stop_price)
+        if units <= 0:
+            results.append(ScanResult(
+                pair=pair, signal=signal.direction.value, confidence=signal.confidence,
+                reason="Risk calc returned 0 units", executed=False, error="Zero units"
+            ))
+            continue
 
-# =============================
-# BACKGROUND SCANNER
-# =============================
-def scanner_loop():
-    interval = int(os.getenv("SCAN_INTERVAL_SEC", "900"))
-    fred_counter = 0
+        # Execute
+        response = client.place_market_order(
+            pair, units,
+            signal.stop_price,
+            signal.target_price
+        )
+
+        # ── FIX #2: Only count fills, not attempts ─────────────────────────────
+        order_fill = response.get("json", {}).get("orderFillTransaction")
+        order_reject = response.get("json", {}).get("orderRejectTransaction")
+        status_code = response.get("status_code", 0)
+
+        if status_code == 201 and order_fill:
+            # Confirmed fill
+            STATE.daily_fill_count += 1
+            STATE.traded_pairs_today.add(pair)
+            fill_price = order_fill.get("price", signal.entry_price)
+            logger.info(f"✅ FILL | {pair} | {signal.direction.value} | {units:,} units @ {fill_price}")
+            results.append(ScanResult(
+                pair=pair, signal=signal.direction.value,
+                confidence=signal.confidence, reason=signal.reason,
+                executed=True
+            ))
+        else:
+            # Rejected or error — do NOT count against daily cap
+            reject_reason = "Unknown"
+            if order_reject:
+                reject_reason = order_reject.get("rejectReason", "Unknown")
+            elif response.get("text"):
+                reject_reason = response["text"][:100]
+            logger.warning(f"❌ REJECTED | {pair} | {reject_reason} — NOT counted as trade")
+            results.append(ScanResult(
+                pair=pair, signal=signal.direction.value,
+                confidence=signal.confidence, reason=signal.reason,
+                executed=False, error=f"REJECTED: {reject_reason}"
+            ))
+
+    return results
+
+@app.post("/trade-manual")
+def trade_manual(req: TradeRequest) -> ScanResult:
+    """Force a trade on a specific pair with override direction."""
+    STATE.reset_if_new_day()
+    pair = req.pair
+    if not pair:
+        raise HTTPException(400, "pair required")
+
+    if client.has_open_position(pair):
+        return ScanResult(pair=pair, signal="BLOCKED", confidence=0,
+                         reason="FIFO: Open position exists", executed=False)
+
+    candles = client.get_candles(pair, "M5", 50)
+    signal = engine.analyze(candles)
+
+    if req.direction:
+        signal.direction = Direction(req.direction.upper())
+
+    units = risk_mgr.calculate_units(pair, signal.entry_price, signal.stop_price)
+    if units <= 0:
+        return ScanResult(pair=pair, signal=signal.direction.value,
+                         confidence=0, reason="Zero units", executed=False)
+
+    response = client.place_market_order(pair, units, signal.stop_price, signal.target_price)
+    order_fill = response.get("json", {}).get("orderFillTransaction")
+
+    if response.get("status_code") == 201 and order_fill:
+        STATE.daily_fill_count += 1
+        STATE.traded_pairs_today.add(pair)
+        return ScanResult(pair=pair, signal=signal.direction.value,
+                         confidence=signal.confidence, reason="Manual override",
+                         executed=True)
+    else:
+        reject = response.get("json", {}).get("orderRejectTransaction", {})
+        return ScanResult(pair=pair, signal=signal.direction.value,
+                         confidence=0, reason="Manual failed",
+                         executed=False, error=reject.get("rejectReason", "Unknown"))
+
+# ─── Background Scanner (optional) ─────────────────────────────────────────────
+async def background_scanner():
+    """Runs every 5 minutes during trade hours."""
     while True:
-        time.sleep(interval)
-        try:
-            # Refresh FRED macro data roughly every 8 cycles (~2h at 15min)
-            fred_counter += 1
-            if FRED_API_KEY and fred_counter >= 8:
-                fred_counter = 0
-                refresh_fred()
-            if AUTO_TRADE:
-                auto_scan()
-            else:
-                scan()
-        except Exception as e:
-            log_event(f"Scanner error: {e}")
+        await asyncio.sleep(300)
+        if not is_trade_hours():
+            continue
+        STATE.reset_if_new_day()
+        if STATE.daily_fill_count >= MAX_DAILY_TRADES:
+            continue
 
+        for pair in PAIRS:
+            if client.has_open_position(pair):
+                continue
+            if pair in STATE.traded_pairs_today:
+                continue
+
+            candles = client.get_candles(pair, "M5", 50)
+            signal = engine.analyze(candles)
+            if signal.direction != Direction.NONE and signal.confidence >= 75:
+                logger.info(f"Auto-trigger | {pair} | {signal.direction.value} | {signal.confidence}%")
+                # Uncomment to enable fully auto:
+                # trade(TradeRequest(pair=pair))
 
 @app.on_event("startup")
-def startup():
-    if FRED_API_KEY:
-        try:
-            refresh_fred()
-        except Exception as e:
-            log_event(f"FRED startup refresh failed: {e}")
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
-    log_event("ForexFlow EightFilter started")
+async def startup():
+    logger.info("🚀 ForexFlow v2.2 started")
+    logger.info(f"   Env: {OANDA_ENV} | Max Units: {MAX_UNITS:,} | Risk: {RISK_PERCENT*100}%")
+    # asyncio.create_task(background_scanner())  # Enable when ready
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

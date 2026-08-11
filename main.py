@@ -1,14 +1,13 @@
 """
-ForexFlow EightFilter v2.2 — Spot Forex + Futures Volume + COT + FRED Macro
+ForexFlow EightFilter v2.3 — Spot Forex + Futures Volume + COT + FRED Macro
 Single file: main.py
 Railway: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
 Requirements: fastapi, uvicorn, requests, pydantic
-v2.2 fixes: open-position check (no FIFO rejects), count fills not attempts,
-one trade per pair per day, configurable unit cap
+v2.3 fixes: real daily P&L enforcement, JPY price precision, margin-aware
+sizing, real reject reasons, JPY pip-value correction
 """
 
 import os
-import json
 import time
 import threading
 from datetime import datetime, timezone
@@ -19,7 +18,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 # =============================
-# CONFIG (Railway env vars)
+# CONFIG
 # =============================
 OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
 OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
@@ -31,7 +30,9 @@ MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
 MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "65"))
 MACRO_BLOCK_PCT = float(os.getenv("MACRO_BLOCK_PCT", "0.8"))
-MAX_UNITS = int(os.getenv("MAX_UNITS", "2000000"))       # v2.2: raised cap
+MAX_UNITS = int(os.getenv("MAX_UNITS", "2000000"))
+LEVERAGE = float(os.getenv("LEVERAGE", "30"))            # OANDA practice default 30:1
+MARGIN_USAGE_PCT = float(os.getenv("MARGIN_USAGE_PCT", "50"))  # max % of available margin per trade
 ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -42,27 +43,28 @@ OANDA_BASE = (
     else "https://api-fxtrade.oanda.com"
 )
 
+# v2.3: dec = price decimals per pair (JPY = 3)
 PAIR_MAP = {
     "EUR_USD": {
-        "future": "6E", "pip": 0.0001,
+        "future": "6E", "pip": 0.0001, "dec": 5, "pip_val_1k": 0.10,
         "vol_invert": False, "cot_invert": False,
         "fred_series": "DEXUSEU", "fred_up_means": "LONG",
     },
     "GBP_USD": {
-        "future": "6B", "pip": 0.0001,
+        "future": "6B", "pip": 0.0001, "dec": 5, "pip_val_1k": 0.10,
         "vol_invert": False, "cot_invert": False,
         "fred_series": "DEXUSUK", "fred_up_means": "LONG",
     },
     "USD_JPY": {
-        "future": "6J", "pip": 0.01,
+        "future": "6J", "pip": 0.01, "dec": 3, "pip_val_1k": 0.065,
         "vol_invert": True, "cot_invert": True,
         "fred_series": "DEXJPUS", "fred_up_means": "LONG",
     },
 }
 
-SESSIONS = [(7, 11), (12, 16)]  # UTC: London + NY
+SESSIONS = [(7, 11), (12, 16)]
 
-app = FastAPI(title="ForexFlow EightFilter", version="2.2.0")
+app = FastAPI(title="ForexFlow EightFilter", version="2.3.0")
 
 # =============================
 # STATE
@@ -71,7 +73,7 @@ STATE: Dict[str, Any] = {
     "volume": {},
     "cot": {},
     "fred": {},
-    "daily": {"date": "", "trades": 0, "pnl": 0.0, "traded_pairs": []},
+    "daily": {"date": "", "trades": 0, "start_balance": None, "traded_pairs": []},
     "log": [],
 }
 
@@ -96,6 +98,11 @@ def telegram(msg: str):
         )
     except Exception as e:
         log_event(f"Telegram failed: {e}")
+
+
+def fmt_price(pair: str, price: float) -> str:
+    """v2.3: correct decimals per instrument (JPY = 3)."""
+    return f"{price:.{PAIR_MAP[pair]['dec']}f}"
 
 
 # =============================
@@ -124,13 +131,22 @@ def oanda_post(path: str, payload: dict):
     return r
 
 
+def get_account_summary() -> dict:
+    return oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/summary")["account"]
+
+
 def get_balance() -> float:
-    acct = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/summary")
-    return float(acct["account"]["balance"])
+    return float(get_account_summary()["balance"])
+
+
+def get_margin_available() -> float:
+    try:
+        return float(get_account_summary().get("marginAvailable", 0))
+    except Exception:
+        return 0.0
 
 
 def get_open_position_pairs() -> List[str]:
-    """v2.2: pairs with any open position (FIFO protection)."""
     try:
         data = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openPositions")
         return [p["instrument"] for p in data.get("positions", [])]
@@ -158,24 +174,27 @@ def get_candles(pair: str, count: int = 60, gran: str = "M15") -> List[dict]:
 
 
 def place_market_order(pair: str, units: int, sl: float, tp: float):
-    """v2.2: returns (success, response_json, reason)."""
+    """v2.3: returns (success, response_json, human_reason)."""
     payload = {
         "order": {
             "instrument": pair,
             "units": str(units),
             "type": "MARKET",
             "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": f"{sl:.5f}"},
-            "takeProfitOnFill": {"price": f"{tp:.5f}"},
+            "stopLossOnFill": {"price": fmt_price(pair, sl)},
+            "takeProfitOnFill": {"price": fmt_price(pair, tp)},
         }
     }
     r = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
     body = r.json() if r.content else {}
     if r.status_code in (200, 201) and "orderFillTransaction" in body:
         return True, body, "filled"
-    reason = body.get("orderRejectTransaction", {}).get(
-        "rejectReason",
-        body.get("errorMessage", f"HTTP {r.status_code}")
+    # v2.3: real reject/cancel reasons
+    reason = (
+        body.get("orderCancelTransaction", {}).get("cancelReason")
+        or body.get("orderRejectTransaction", {}).get("rejectReason")
+        or body.get("errorMessage")
+        or f"HTTP {r.status_code}"
     )
     return False, body, str(reason)
 
@@ -399,23 +418,65 @@ def eight_filter_analyze(pair: str) -> Dict[str, Any]:
 
 
 # =============================
-# SIZING
+# SIZING (v2.3: margin-aware)
 # =============================
-def calc_units(pair: str, entry: float, sl: float, balance: float) -> int:
+def calc_units(pair: str, entry: float, sl: float, balance: float) -> Dict[str, Any]:
     cfg = PAIR_MAP[pair]
     risk_dollars = balance * (RISK_PER_TRADE_PCT / 100)
     sl_pips = abs(entry - sl) / cfg["pip"]
     if sl_pips <= 0:
-        return 0
-    pip_value = 0.10 if "JPY" not in pair else 6.5
-    units = int(risk_dollars / (sl_pips * pip_value) * 1000)
-    return max(1000, min(units, MAX_UNITS))
+        return {"units": 0, "reason": "zero stop distance"}
+
+    # Risk-based sizing (v2.3: correct per-pair pip values)
+    risk_units = int(risk_dollars / (sl_pips * cfg["pip_val_1k"]) * 1000)
+
+    # Margin-based cap: notional = units * price (USD_JPY: units are USD already)
+    margin_avail = get_margin_available()
+    price_factor = 1.0 if pair.startswith("USD") else entry
+    max_notional = margin_avail * LEVERAGE * (MARGIN_USAGE_PCT / 100)
+    margin_units = int(max_notional / price_factor) if price_factor else 0
+
+    units = min(risk_units, margin_units, MAX_UNITS)
+    capped_by = "risk"
+    if units == margin_units and margin_units < risk_units:
+        capped_by = "margin"
+    elif units == MAX_UNITS and MAX_UNITS < min(risk_units, margin_units):
+        capped_by = "max_units"
+
+    return {
+        "units": max(0, units),
+        "risk_units": risk_units,
+        "margin_units": margin_units,
+        "margin_available": margin_avail,
+        "capped_by": capped_by,
+    }
 
 
 def reset_daily():
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if STATE["daily"]["date"] != today:
-        STATE["daily"] = {"date": today, "trades": 0, "pnl": 0.0, "traded_pairs": []}
+        start_bal = None
+        try:
+            start_bal = get_balance()
+        except Exception as e:
+            log_event(f"start balance fetch failed: {e}")
+        STATE["daily"] = {
+            "date": today,
+            "trades": 0,
+            "start_balance": start_bal,
+            "traded_pairs": [],
+        }
+
+
+def daily_pnl() -> float:
+    """v2.3: REAL realized P&L vs day-start balance."""
+    sb = STATE["daily"].get("start_balance")
+    if sb is None:
+        return 0.0
+    try:
+        return get_balance() - sb
+    except Exception:
+        return 0.0
 
 
 # =============================
@@ -450,7 +511,7 @@ class ManualTrade(BaseModel):
 def health():
     return {
         "status": "ok",
-        "version": "2.2.0",
+        "version": "2.3.0",
         "engine": "eight-filter",
         "oanda": {
             "env": OANDA_ENV,
@@ -472,8 +533,15 @@ def health():
 @app.get("/balance")
 def balance():
     try:
-        b = get_balance()
-        return {"balance": b, "env": OANDA_ENV, "status": "connected"}
+        acct = get_account_summary()
+        return {
+            "balance": float(acct["balance"]),
+            "nav": float(acct.get("NAV", acct["balance"])),
+            "margin_available": float(acct.get("marginAvailable", 0)),
+            "unrealized_pl": float(acct.get("unrealizedPL", 0)),
+            "env": OANDA_ENV,
+            "status": "connected",
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -546,9 +614,11 @@ def scan():
             results.append(eight_filter_analyze(pair))
         except Exception as e:
             results.append({"pair": pair, "proceed": False, "reason": str(e)})
+    d = dict(STATE["daily"])
+    d["realized_pnl"] = round(daily_pnl(), 2)
     return {
         "results": results,
-        "daily": STATE["daily"],
+        "daily": d,
         "auto_trade": AUTO_TRADE,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
@@ -559,25 +629,31 @@ def execute_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     daily = STATE["daily"]
     pair = sig["pair"]
 
-    # v2.2 — circuit breakers
     if daily["trades"] >= MAX_TRADES_PER_DAY:
         return {"executed": False, "reason": "max trades per day reached"}
-    if daily["pnl"] <= -abs(DAILY_LOSS_LIMIT):
-        return {"executed": False, "reason": "daily loss limit hit"}
+
+    # v2.3: REAL loss-limit enforcement
+    pnl = daily_pnl()
+    if pnl <= -abs(DAILY_LOSS_LIMIT):
+        msg = f"daily loss limit hit (pnl {pnl:.2f} <= -{DAILY_LOSS_LIMIT})"
+        log_event("LOCKDOWN: " + msg)
+        return {"executed": False, "reason": msg}
+
     if not sig.get("proceed"):
         return {"executed": False, "reason": "signal not qualified"}
 
-    # v2.2 — one trade per pair per day
     if ONE_TRADE_PER_PAIR and pair in daily.get("traded_pairs", []):
         return {"executed": False, "reason": f"{pair} already traded today"}
 
-    # v2.2 — FIFO protection: skip if position already open on this pair
     open_pairs = get_open_position_pairs()
     if pair in open_pairs:
         return {"executed": False, "reason": f"{pair} position already open"}
 
     balance_amt = get_balance()
-    units = calc_units(pair, sig["entry"], sig["stop_loss"], balance_amt)
+    sizing = calc_units(pair, sig["entry"], sig["stop_loss"], balance_amt)
+    units = sizing["units"]
+    if units < 1000:
+        return {"executed": False, "reason": f"sizing too small: {sizing}"}
     if sig["direction"] == "SHORT":
         units = -units
 
@@ -585,7 +661,6 @@ def execute_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
         pair, units, sig["stop_loss"], sig["take_profit"]
     )
 
-    # v2.2 — only count CONFIRMED FILLS, not attempts
     if not ok:
         msg = f"ORDER REJECTED {sig['direction']} {pair} units={units} — {reason}"
         log_event(msg)
@@ -599,11 +674,12 @@ def execute_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     msg = (
         f"TRADE {sig['direction']} {pair} units={units} "
         f"fill={fill_price} sl={sig['stop_loss']} tp={sig['take_profit']} "
-        f"conf={sig['confidence']}%"
+        f"conf={sig['confidence']}% (sized_by={sizing['capped_by']})"
     )
     log_event(msg)
     telegram("✅ " + msg)
-    return {"executed": True, "fill_price": fill_price, "oanda_response": resp, "signal": sig}
+    return {"executed": True, "fill_price": fill_price, "sizing": sizing,
+            "oanda_response": resp, "signal": sig}
 
 
 @app.post("/trade")
@@ -641,8 +717,11 @@ def logs():
 
 @app.get("/dashboard")
 def dashboard():
+    d = dict(STATE["daily"])
+    d["realized_pnl"] = round(daily_pnl(), 2)
+    d["loss_limit"] = DAILY_LOSS_LIMIT
     return {
-        "daily": STATE["daily"],
+        "daily": d,
         "volume": STATE["volume"],
         "cot": STATE["cot"],
         "fred": STATE["fred"],
@@ -654,6 +733,8 @@ def dashboard():
             "min_confidence": MIN_CONFIDENCE,
             "macro_block_pct": MACRO_BLOCK_PCT,
             "max_units": MAX_UNITS,
+            "leverage": LEVERAGE,
+            "margin_usage_pct": MARGIN_USAGE_PCT,
             "one_trade_per_pair": ONE_TRADE_PER_PAIR,
             "auto_trade": AUTO_TRADE,
             "env": OANDA_ENV,
@@ -691,4 +772,4 @@ def startup():
             log_event(f"FRED startup refresh failed: {e}")
     t = threading.Thread(target=scanner_loop, daemon=True)
     t.start()
-    log_event("ForexFlow EightFilter v2.2 started")
+    log_event("ForexFlow EightFilter v2.3 started")

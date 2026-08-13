@@ -1,775 +1,513 @@
 """
-ForexFlow EightFilter v2.3 — Spot Forex + Futures Volume + COT + FRED Macro
-Single file: main.py
-Railway: uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}
-Requirements: fastapi, uvicorn, requests, pydantic
-v2.3 fixes: real daily P&L enforcement, JPY price precision, margin-aware
-sizing, real reject reasons, JPY pip-value correction
+ForexFlow EightFilter v2.4.0 — Institutional-style forex signal engine
+Full major-pairs expansion: 7 CME-futures-backed pairs (where banks trade)
+New in v2.4.0:
+  - 7 pairs: EUR_USD, GBP_USD, USD_JPY, AUD_USD, NZD_USD, USD_CAD, USD_CHF
+  - Session chop skip: first CHOP_SKIP_MIN of each session ignored (London 07:30-11:00, NY 12:30-16:00 UTC)
+  - Dynamic pip-value sizing (works for USD-base and USD-quote pairs)
+  - Volume/COT accepted for 6E, 6B, 6J, 6A, 6N, 6C, 6S
+Eight filters:
+  F1 VWAP deviation | F2 EMA20/50 trend | F3 CME futures volume | F4 RSI exhaustion
+  F5 Session (chop-skipped) | F6 EV gap (2:1 RR) | F7 COT positioning | F8 FRED macro
+Risk: 1% per trade, max 3/day, $500 daily loss LOCKDOWN, margin-aware sizing,
+      FIFO-safe, one trade per pair per day.
 """
-
-import os
-import time
-import threading
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
-
+import os, time, math, threading, logging
+from datetime import datetime, timezone, date
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 
-# =============================
-# CONFIG
-# =============================
-OANDA_API_KEY = os.getenv("OANDA_API_KEY", "")
-OANDA_ACCOUNT_ID = os.getenv("OANDA_ACCOUNT_ID", "")
-OANDA_ENV = os.getenv("OANDA_ENV", "practice")
-FRED_API_KEY = os.getenv("FRED_API_KEY", "")
-AUTO_TRADE = os.getenv("AUTO_TRADE", "false").lower() == "true"
-RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
-DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
-MIN_CONFIDENCE = float(os.getenv("MIN_CONFIDENCE", "65"))
-MACRO_BLOCK_PCT = float(os.getenv("MACRO_BLOCK_PCT", "0.8"))
-MAX_UNITS = int(os.getenv("MAX_UNITS", "2000000"))
-LEVERAGE = float(os.getenv("LEVERAGE", "30"))            # OANDA practice default 30:1
-MARGIN_USAGE_PCT = float(os.getenv("MARGIN_USAGE_PCT", "50"))  # max % of available margin per trade
-ONE_TRADE_PER_PAIR = os.getenv("ONE_TRADE_PER_PAIR", "true").lower() == "true"
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+log = logging.getLogger("forexflow")
 
-OANDA_BASE = (
-    "https://api-fxpractice.oanda.com"
-    if OANDA_ENV == "practice"
-    else "https://api-fxtrade.oanda.com"
-)
+# ---------------- CONFIG ----------------
+OANDA_API_KEY   = os.getenv("OANDA_API_KEY", "")
+OANDA_ACCOUNT   = os.getenv("OANDA_ACCOUNT_ID", "")
+OANDA_ENV       = os.getenv("OANDA_ENV", "practice")
+FRED_API_KEY    = os.getenv("FRED_API_KEY", "")
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# v2.3: dec = price decimals per pair (JPY = 3)
+AUTO_TRADE        = os.getenv("AUTO_TRADE", "false").lower() == "true"
+RISK_PCT          = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+DAILY_LOSS_LIMIT  = float(os.getenv("DAILY_LOSS_LIMIT", "500"))
+MAX_TRADES_DAY    = int(os.getenv("MAX_TRADES_PER_DAY", "3"))
+MAX_UNITS         = int(os.getenv("MAX_UNITS", "2000000"))
+MIN_CONFIDENCE    = float(os.getenv("MIN_CONFIDENCE", "65"))
+MACRO_BLOCK_PCT   = float(os.getenv("MACRO_BLOCK_PCT", "0.8"))
+SCAN_INTERVAL     = int(os.getenv("SCAN_INTERVAL_SEC", "900"))
+LEVERAGE          = float(os.getenv("LEVERAGE", "30"))
+MARGIN_USAGE_PCT  = float(os.getenv("MARGIN_USAGE_PCT", "50"))
+CHOP_SKIP_MIN     = int(os.getenv("CHOP_SKIP_MIN", "30"))  # skip first N min of each session
+
+BASE = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
+HEADERS = {"Authorization": f"Bearer {OANDA_API_KEY}", "Content-Type": "application/json"}
+
+# Sessions in UTC hours: (name, open, close) — chop skip applied to open
+SESSIONS = [("London", 7.0, 11.0), ("NewYork", 12.0, 16.0)]
+
+# ---------------- PAIR MAP ----------------
+# vol_invert / cot_invert: True when the CME contract is quoted foreign/USD
+#   and the pair is USD/foreign (6J, 6C, 6S) -> strength in contract = pair down.
+# fred_series + fred_up_means: expected pair direction when series rises.
 PAIR_MAP = {
-    "EUR_USD": {
-        "future": "6E", "pip": 0.0001, "dec": 5, "pip_val_1k": 0.10,
-        "vol_invert": False, "cot_invert": False,
-        "fred_series": "DEXUSEU", "fred_up_means": "LONG",
-    },
-    "GBP_USD": {
-        "future": "6B", "pip": 0.0001, "dec": 5, "pip_val_1k": 0.10,
-        "vol_invert": False, "cot_invert": False,
-        "fred_series": "DEXUSUK", "fred_up_means": "LONG",
-    },
-    "USD_JPY": {
-        "future": "6J", "pip": 0.01, "dec": 3, "pip_val_1k": 0.065,
-        "vol_invert": True, "cot_invert": True,
-        "fred_series": "DEXJPUS", "fred_up_means": "LONG",
-    },
+    "EUR_USD": {"future": "6E", "pip": 0.0001, "dec": 5, "vol_invert": False, "cot_invert": False, "fred_series": "DEXUSEU", "fred_up_means": "LONG"},
+    "GBP_USD": {"future": "6B", "pip": 0.0001, "dec": 5, "vol_invert": False, "cot_invert": False, "fred_series": "DEXUSUK", "fred_up_means": "LONG"},
+    "AUD_USD": {"future": "6A", "pip": 0.0001, "dec": 5, "vol_invert": False, "cot_invert": False, "fred_series": "DEXUSAL", "fred_up_means": "LONG"},
+    "NZD_USD": {"future": "6N", "pip": 0.0001, "dec": 5, "vol_invert": False, "cot_invert": False, "fred_series": "DEXUSNZ", "fred_up_means": "LONG"},
+    "USD_JPY": {"future": "6J", "pip": 0.01,   "dec": 3, "vol_invert": True,  "cot_invert": True,  "fred_series": "DEXJPUS", "fred_up_means": "LONG"},
+    "USD_CAD": {"future": "6C", "pip": 0.0001, "dec": 5, "vol_invert": True,  "cot_invert": True,  "fred_series": "DEXCAUS", "fred_up_means": "LONG"},
+    "USD_CHF": {"future": "6S", "pip": 0.0001, "dec": 5, "vol_invert": True,  "cot_invert": True,  "fred_series": "DEXSZUS", "fred_up_means": "LONG"},
 }
+PAIRS = list(PAIR_MAP.keys())
 
-SESSIONS = [(7, 11), (12, 16)]
+# ---------------- STATE (in-memory; wipes on redeploy) ----------------
+LOGS = []
+VOLUME = {}   # future -> {"net_pct": float, "ts": str}
+COT = {}      # future -> {"net": float, "ts": str}
+FRED = {}     # pair -> 5d pct change
+DAILY = {"date": None, "trades": 0, "start_balance": None, "traded_pairs": [], "lockdown": False}
 
-app = FastAPI(title="ForexFlow EightFilter", version="2.3.0")
+def logmsg(msg):
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "msg": msg}
+    LOGS.append(entry)
+    if len(LOGS) > 500:
+        del LOGS[:-500]
+    log.info(msg)
 
-# =============================
-# STATE
-# =============================
-STATE: Dict[str, Any] = {
-    "volume": {},
-    "cot": {},
-    "fred": {},
-    "daily": {"date": "", "trades": 0, "start_balance": None, "traded_pairs": []},
-    "log": [],
-}
-
-
-def log_event(msg: str):
-    STATE["log"].append({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "msg": msg,
-    })
-    STATE["log"] = STATE["log"][-200:]
-    print(msg)
-
-
-def telegram(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+def tg(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
-            timeout=10,
-        )
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                      json={"chat_id": TELEGRAM_CHAT, "text": msg}, timeout=10)
     except Exception as e:
-        log_event(f"Telegram failed: {e}")
+        logmsg(f"Telegram error: {e}")
 
-
-def fmt_price(pair: str, price: float) -> str:
-    """v2.3: correct decimals per instrument (JPY = 3)."""
-    return f"{price:.{PAIR_MAP[pair]['dec']}f}"
-
-
-# =============================
-# OANDA CLIENT
-# =============================
-def oanda_headers():
-    return {
-        "Authorization": f"Bearer {OANDA_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-
-def oanda_get(path: str):
-    r = requests.get(f"{OANDA_BASE}{path}", headers=oanda_headers(), timeout=15)
+# ---------------- OANDA HELPERS ----------------
+def oanda_get(path):
+    r = requests.get(f"{BASE}{path}", headers=HEADERS, timeout=15)
     r.raise_for_status()
     return r.json()
 
+def get_account():
+    a = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/summary")["account"]
+    return {"balance": float(a["balance"]), "nav": float(a["NAV"]),
+            "margin_available": float(a.get("marginAvailable", a["balance"])),
+            "unrealized_pl": float(a.get("unrealizedPL", 0.0))}
 
-def oanda_post(path: str, payload: dict):
-    r = requests.post(
-        f"{OANDA_BASE}{path}",
-        headers=oanda_headers(),
-        json=payload,
-        timeout=15,
-    )
-    return r
+def get_candles(pair, count=60, gran="M15"):
+    d = oanda_get(f"/v3/instruments/{pair}/candles?count={count}&granularity={gran}&price=M")
+    out = []
+    for c in d["candles"]:
+        if c["complete"]:
+            out.append({"t": c["time"], "o": float(c["mid"]["o"]), "h": float(c["mid"]["h"]),
+                        "l": float(c["mid"]["l"]), "c": float(c["mid"]["c"]), "v": float(c.get("volume", 0))})
+    return out
 
+def get_price(pair):
+    d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/pricing?instruments={pair}")
+    p = d["prices"][0]
+    bid = float(p["bids"][0]["price"]); ask = float(p["asks"][0]["price"])
+    return (bid + ask) / 2.0
 
-def get_account_summary() -> dict:
-    return oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/summary")["account"]
+def get_open_position_pairs():
+    d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/openPositions")
+    return {p["instrument"] for p in d.get("positions", [])}
 
+def fmt_price(pair, price):
+    return f"{price:.{PAIR_MAP[pair]['dec']}f}"
 
-def get_balance() -> float:
-    return float(get_account_summary()["balance"])
+# ---------------- DAILY / RISK ----------------
+def reset_daily():
+    today = date.today().isoformat()
+    if DAILY["date"] != today:
+        try:
+            bal = get_account()["balance"]
+        except Exception:
+            bal = None
+        DAILY.update({"date": today, "trades": 0, "start_balance": bal,
+                      "traded_pairs": [], "lockdown": False})
+        logmsg(f"Daily reset {today}: start_balance={bal}")
 
-
-def get_margin_available() -> float:
+def daily_pnl():
+    if DAILY["start_balance"] is None:
+        return 0.0
     try:
-        return float(get_account_summary().get("marginAvailable", 0))
+        return get_account()["balance"] - DAILY["start_balance"]
     except Exception:
         return 0.0
 
+def pip_value_per_unit(pair, price):
+    """USD pip value per unit. Quote=USD -> pip. Base=USD -> pip/price."""
+    pip = PAIR_MAP[pair]["pip"]
+    if pair.endswith("_USD"):
+        return pip
+    return pip / price
 
-def get_open_position_pairs() -> List[str]:
+def calc_units(pair, price, stop_dist, balance, margin_avail):
+    risk_amt = balance * (RISK_PCT / 100.0)
+    pv = pip_value_per_unit(pair, price)
+    risk_units = int(risk_amt / (stop_dist * pv)) if pv > 0 else 0
+    notional_per_unit = price if pair.endswith("_USD") else 1.0
+    margin_units = int(margin_avail * LEVERAGE * (MARGIN_USAGE_PCT / 100.0) / notional_per_unit)
+    units = min(risk_units, margin_units, MAX_UNITS)
+    capped = "risk" if units == risk_units and units < MAX_UNITS else ("margin" if units == margin_units else "max")
+    return {"units": max(units, 0), "risk_units": risk_units, "margin_units": margin_units, "capped_by": capped}
+
+def place_market_order(pair, direction, units, price, sl, tp):
+    u = units if direction == "LONG" else -units
+    order = {"order": {"type": "MARKET", "instrument": pair, "units": str(u),
+                       "stopLossOnFill": {"price": fmt_price(pair, sl)},
+                       "takeProfitOnFill": {"price": fmt_price(pair, tp)}}}
     try:
-        data = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT_ID}/openPositions")
-        return [p["instrument"] for p in data.get("positions", [])]
+        r = requests.post(f"{BASE}/v3/accounts/{OANDA_ACCOUNT}/orders",
+                          headers=HEADERS, json=order, timeout=15)
+        d = r.json()
+        if r.status_code in (200, 201) and "orderFillTransaction" in d:
+            fill = float(d["orderFillTransaction"]["price"])
+            return {"ok": True, "fill": fill}
+        reason = (d.get("orderCancelTransaction", {}).get("cancelReason")
+                  or d.get("orderRejectTransaction", {}).get("rejectReason")
+                  or d.get("errorMessage") or f"HTTP {r.status_code}")
+        return {"ok": False, "reason": reason}
     except Exception as e:
-        log_event(f"openPositions check failed: {e}")
-        return []
+        return {"ok": False, "reason": str(e)}
 
-
-def get_candles(pair: str, count: int = 60, gran: str = "M15") -> List[dict]:
-    data = oanda_get(
-        f"/v3/instruments/{pair}/candles?count={count}&granularity={gran}&price=M"
-    )
-    out = []
-    for c in data.get("candles", []):
-        if not c.get("complete", True):
-            continue
-        out.append({
-            "time": c["time"],
-            "o": float(c["mid"]["o"]),
-            "h": float(c["mid"]["h"]),
-            "l": float(c["mid"]["l"]),
-            "c": float(c["mid"]["c"]),
-        })
-    return out
-
-
-def place_market_order(pair: str, units: int, sl: float, tp: float):
-    """v2.3: returns (success, response_json, human_reason)."""
-    payload = {
-        "order": {
-            "instrument": pair,
-            "units": str(units),
-            "type": "MARKET",
-            "positionFill": "DEFAULT",
-            "stopLossOnFill": {"price": fmt_price(pair, sl)},
-            "takeProfitOnFill": {"price": fmt_price(pair, tp)},
-        }
-    }
-    r = oanda_post(f"/v3/accounts/{OANDA_ACCOUNT_ID}/orders", payload)
-    body = r.json() if r.content else {}
-    if r.status_code in (200, 201) and "orderFillTransaction" in body:
-        return True, body, "filled"
-    # v2.3: real reject/cancel reasons
-    reason = (
-        body.get("orderCancelTransaction", {}).get("cancelReason")
-        or body.get("orderRejectTransaction", {}).get("rejectReason")
-        or body.get("errorMessage")
-        or f"HTTP {r.status_code}"
-    )
-    return False, body, str(reason)
-
-
-# =============================
-# FRED CLIENT
-# =============================
-def fred_series_latest(series_id: str, n: int = 8) -> List[dict]:
-    if not FRED_API_KEY:
-        return []
-    url = (
-        "https://api.stlouisfed.org/fred/series/observations"
-        f"?series_id={series_id}&api_key={FRED_API_KEY}"
-        f"&file_type=json&sort_order=desc&limit={n}"
-    )
-    r = requests.get(url, timeout=15)
-    r.raise_for_status()
-    obs = []
-    for o in r.json().get("observations", []):
-        if o.get("value") not in (None, ".", ""):
-            obs.append({"date": o["date"], "value": float(o["value"])})
-    return obs
-
-
-def refresh_fred():
-    for pair, cfg in PAIR_MAP.items():
-        try:
-            obs = fred_series_latest(cfg["fred_series"], n=8)
-            if len(obs) < 6:
-                continue
-            latest = obs[0]
-            five_back = obs[5]
-            chg = (latest["value"] - five_back["value"]) / five_back["value"] * 100
-            STATE["fred"][pair] = {
-                "series": cfg["fred_series"],
-                "latest_date": latest["date"],
-                "latest_value": latest["value"],
-                "change_5d_pct": round(chg, 3),
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            log_event(f"FRED {pair} ({cfg['fred_series']}): 5d {chg:+.2f}%")
-        except Exception as e:
-            log_event(f"FRED refresh failed {pair}: {e}")
-
-
-# =============================
-# INDICATORS
-# =============================
-def ema(values: List[float], period: int) -> float:
-    if len(values) < period:
-        return values[-1]
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
+# ---------------- INDICATORS ----------------
+def ema(vals, n):
+    k = 2 / (n + 1); e = vals[0]
+    for v in vals[1:]:
         e = v * k + e * (1 - k)
     return e
 
-
-def rsi(closes: List[float], period: int = 14) -> float:
-    if len(closes) < period + 1:
+def rsi(closes, n=14):
+    if len(closes) < n + 1:
         return 50.0
     gains, losses = [], []
-    for i in range(-period, 0):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains) / period
-    al = sum(losses) / period
+    for i in range(-n, 0):
+        ch = closes[i] - closes[i - 1]
+        gains.append(max(ch, 0)); losses.append(max(-ch, 0))
+    ag = sum(gains) / n; al = sum(losses) / n
     if al == 0:
         return 100.0
     return 100 - 100 / (1 + ag / al)
 
-
-def atr(candles: List[dict], period: int = 14) -> float:
-    if len(candles) < period + 1:
-        return 0.001
+def atr(candles, n=14):
+    if len(candles) < n + 1:
+        return 0.0
     trs = []
-    for i in range(-period, 0):
+    for i in range(-n, 0):
         h, l, pc = candles[i]["h"], candles[i]["l"], candles[i - 1]["c"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    return sum(trs) / period
+    return sum(trs) / n
 
+def vwap(candles):
+    pv = sum(((c["h"] + c["l"] + c["c"]) / 3) * c["v"] for c in candles)
+    vv = sum(c["v"] for c in candles)
+    return pv / vv if vv > 0 else candles[-1]["c"]
 
-def vwap(candles: List[dict]) -> float:
-    num = den = 0.0
-    for c in candles[-32:]:
-        tp = (c["h"] + c["l"] + c["c"]) / 3
-        num += tp
-        den += 1
-    return num / den if den else candles[-1]["c"]
+# ---------------- FRED ----------------
+def fred_series_latest(series_id, n=8):
+    if not FRED_API_KEY:
+        return None
+    try:
+        r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                         params={"series_id": series_id, "api_key": FRED_API_KEY,
+                                 "file_type": "json", "sort_order": "desc", "limit": n},
+                         timeout=15)
+        vals = [float(o["value"]) for o in r.json().get("observations", []) if o["value"] not in (".", "")]
+        return vals  # newest first
+    except Exception as e:
+        logmsg(f"FRED error {series_id}: {e}")
+        return None
 
+def refresh_fred():
+    for pair, cfg in PAIR_MAP.items():
+        vals = fred_series_latest(cfg["fred_series"])
+        if vals and len(vals) >= 6:
+            chg = (vals[0] - vals[5]) / vals[5] * 100.0
+            FRED[pair] = round(chg, 2)
+            logmsg(f"FRED {pair} ({cfg['fred_series']}): 5d {chg:+.2f}%")
 
-# =============================
-# EIGHT FILTER ENGINE
-# =============================
-def eight_filter_analyze(pair: str) -> Dict[str, Any]:
+# ---------------- EIGHT-FILTER ENGINE ----------------
+def analyze_pair(pair):
     cfg = PAIR_MAP[pair]
-    candles = get_candles(pair, count=60, gran="M15")
+    candles = get_candles(pair)
     if len(candles) < 30:
-        return {"proceed": False, "reason": "not enough candles"}
-
+        return {"pair": pair, "ok": False, "reason": "insufficient candles"}
     closes = [c["c"] for c in candles]
     price = closes[-1]
-    a = atr(candles)
-    r = rsi(closes)
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    vw = vwap(candles)
+    votes = []  # (filter, +1 long / -1 short / 0 neutral, note)
 
-    filters = {}
+    # F1 VWAP deviation
+    vw = vwap(candles[-20:])
+    dev = (price - vw) / vw * 100
+    votes.append(("F1_vwap", 1 if dev > 0.02 else (-1 if dev < -0.02 else 0), f"dev {dev:+.3f}%"))
 
-    dev = (price - vw) / a if a else 0
-    filters["vwap_dev"] = abs(dev) < 2.5
+    # F2 EMA trend
+    e20, e50 = ema(closes[-60:], 20), ema(closes[-60:], 50)
+    votes.append(("F2_ema", 1 if e20 > e50 else -1, f"E20 {'>' if e20 > e50 else '<'} E50"))
 
-    if e20 > e50 and price > e20:
-        direction = "LONG"
-    elif e20 < e50 and price < e20:
-        direction = "SHORT"
+    # F3 Futures volume (manual CME updates)
+    fv = VOLUME.get(cfg["future"])
+    if fv is None:
+        votes.append(("F3_volume", 0, "no data"))
     else:
-        direction = "NONE"
-    filters["trend"] = direction != "NONE"
-
-    fv = STATE["volume"].get(cfg["future"], {})
-    vol_ok = True
-    vol_note = "no futures volume loaded — neutral"
-    if fv:
-        net = fv.get("net_change_pct", 0)
+        net = fv["net_pct"]
         if cfg["vol_invert"]:
             net = -net
-        if direction == "LONG" and net < -1.5:
-            vol_ok = False
-            vol_note = f"{cfg['future']} volume bearish ({net}%) — blocks LONG"
-        elif direction == "SHORT" and net > 1.5:
-            vol_ok = False
-            vol_note = f"{cfg['future']} volume bullish ({net}%) — blocks SHORT"
-        else:
-            vol_note = f"{cfg['future']} volume confirms ({net}%)"
-    filters["futures_volume"] = vol_ok
+        votes.append(("F3_volume", 1 if net > 0.15 else (-1 if net < -0.15 else 0), f"{cfg['future']} net {fv['net_pct']:+.2f}%"))
 
-    filters["rsi_ok"] = not (
-        (direction == "LONG" and r > 75) or (direction == "SHORT" and r < 25)
-    )
+    # F4 RSI exhaustion (fade extreme against trend)
+    r = rsi(closes)
+    if r > 70:
+        votes.append(("F4_rsi", -1, f"RSI {r:.0f} overbought"))
+    elif r < 30:
+        votes.append(("F4_rsi", 1, f"RSI {r:.0f} oversold"))
+    else:
+        votes.append(("F4_rsi", 0, f"RSI {r:.0f}"))
 
-    hour = datetime.now(timezone.utc).hour
-    in_session = any(s <= hour < e for s, e in SESSIONS)
-    filters["session"] = in_session
+    # F5 Session (with chop skip)
+    now = datetime.now(timezone.utc)
+    h = now.hour + now.minute / 60.0
+    in_session = False
+    for name, op, cl in SESSIONS:
+        if (op + CHOP_SKIP_MIN / 60.0) <= h < cl:
+            in_session = True
+            break
+    votes.append(("F5_session", 0, f"{'in session' if in_session else 'out of session/chop'}"))
+    if not in_session:
+        return {"pair": pair, "ok": False, "reason": "out of session (chop-skip or closed)",
+                "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-    sl_dist = 1.5 * a
-    tp_dist = 3.0 * a
-    rr = tp_dist / sl_dist if sl_dist else 0
-    filters["ev_gap"] = rr >= 2.0
+    # F6 EV gap / RR geometry
+    a = atr(candles)
+    if a <= 0:
+        return {"pair": pair, "ok": False, "reason": "ATR zero"}
+    votes.append(("F6_rr", 0, f"ATR {a:.5f} | stop 1.5x target 3.0x (2:1)"))
 
-    cot = STATE["cot"].get(cfg["future"], {})
-    cot_ok = True
-    cot_note = "no COT loaded — neutral"
-    if cot:
-        net = cot.get("net_noncommercial", 0)
+    # F7 COT positioning
+    cot = COT.get(cfg["future"])
+    if cot is None:
+        votes.append(("F7_cot", 0, "no data"))
+    else:
+        net = cot["net"]
+        disp = net
         if cfg["cot_invert"]:
             net = -net
-        if direction == "LONG" and net < -20000:
-            cot_ok = False
-            cot_note = f"COT smart money heavily short ({net}) — blocks LONG"
-        elif direction == "SHORT" and net > 20000:
-            cot_ok = False
-            cot_note = f"COT smart money heavily long ({net}) — blocks SHORT"
+        if net > 20000:
+            votes.append(("F7_cot", 1, f"{cfg['future']} COT {disp:+,.0f}"))
+        elif net < -20000:
+            votes.append(("F7_cot", -1, f"{cfg['future']} COT {disp:+,.0f}"))
         else:
-            cot_note = f"COT aligned or neutral (net {net})"
-        cot_note += f" [report {cot.get('report_date', '?')}]"
-    filters["cot_positioning"] = cot_ok
+            votes.append(("F7_cot", 0, f"{cfg['future']} COT {disp:+,.0f} neutral"))
 
-    fd = STATE["fred"].get(pair, {})
-    fred_ok = True
-    fred_note = "no FRED data — neutral"
-    if fd:
-        chg = fd.get("change_5d_pct", 0)
-        macro_dir = cfg["fred_up_means"] if chg > 0 else (
-            "SHORT" if cfg["fred_up_means"] == "LONG" else "LONG"
-        )
-        if direction != "NONE" and direction != macro_dir and abs(chg) > MACRO_BLOCK_PCT:
-            fred_ok = False
-            fred_note = (
-                f"FRED {fd.get('series')} 5d {chg:+.2f}% macro={macro_dir} "
-                f"— blocks {direction}"
-            )
-        else:
-            fred_note = f"FRED 5d {chg:+.2f}% ({fd.get('latest_date')}) — aligned/neutral"
-    filters["fred_macro"] = fred_ok
-
-    passed = sum(1 for v in filters.values() if v)
-    confidence = round(passed / 8 * 100, 1)
-
-    proceed = (
-        all(filters.values())
-        and direction != "NONE"
-        and confidence >= MIN_CONFIDENCE
-    )
-
-    if direction == "LONG":
-        entry, sl, tp = price, price - sl_dist, price + tp_dist
+    # F8 FRED macro
+    fchg = FRED.get(pair)
+    if fchg is None:
+        votes.append(("F8_fred", 0, "no data"))
     else:
-        entry, sl, tp = price, price + sl_dist, price - tp_dist
+        votes.append(("F8_fred", 1 if fchg > 0 else -1, f"5d {fchg:+.2f}%"))
 
-    return {
-        "pair": pair,
-        "proceed": proceed,
-        "direction": direction,
-        "confidence": confidence,
-        "filters": filters,
-        "volume_note": vol_note,
-        "cot_note": cot_note,
-        "fred_note": fred_note,
-        "price": round(price, 5),
-        "entry": round(entry, 5),
-        "stop_loss": round(sl, 5),
-        "take_profit": round(tp, 5),
-        "atr": round(a, 5),
-        "rsi": round(r, 1),
-        "rr": round(rr, 2),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    score_long = sum(1 for v in votes if v[1] > 0)
+    score_short = sum(1 for v in votes if v[1] < 0)
+    direction = "LONG" if score_long > score_short else "SHORT"
+    total = len(votes)
+    conf = max(score_long, score_short) / total * 100.0
 
+    # Macro veto (FRED against direction beyond threshold)
+    if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
+        fred_dir = "LONG" if fchg > 0 else "SHORT"
+        if cfg["fred_up_means"] == "SHORT":
+            fred_dir = "SHORT" if fchg > 0 else "LONG"
+        if fred_dir != direction:
+            return {"pair": pair, "ok": False, "reason": f"FRED macro veto ({fchg:+.2f}% vs {direction})",
+                    "confidence": round(conf, 1), "direction": direction,
+                    "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-# =============================
-# SIZING (v2.3: margin-aware)
-# =============================
-def calc_units(pair: str, entry: float, sl: float, balance: float) -> Dict[str, Any]:
-    cfg = PAIR_MAP[pair]
-    risk_dollars = balance * (RISK_PER_TRADE_PCT / 100)
-    sl_pips = abs(entry - sl) / cfg["pip"]
-    if sl_pips <= 0:
-        return {"units": 0, "reason": "zero stop distance"}
+    if conf < MIN_CONFIDENCE or score_long == score_short:
+        return {"pair": pair, "ok": False, "reason": f"confidence {conf:.0f}% < {MIN_CONFIDENCE:.0f}%",
+                "confidence": round(conf, 1), "direction": direction,
+                "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-    # Risk-based sizing (v2.3: correct per-pair pip values)
-    risk_units = int(risk_dollars / (sl_pips * cfg["pip_val_1k"]) * 1000)
+    stop_dist = 1.5 * a
+    tgt_dist = 3.0 * a
+    if direction == "LONG":
+        sl, tp = price - stop_dist, price + tgt_dist
+    else:
+        sl, tp = price + stop_dist, price - tgt_dist
 
-    # Margin-based cap: notional = units * price (USD_JPY: units are USD already)
-    margin_avail = get_margin_available()
-    price_factor = 1.0 if pair.startswith("USD") else entry
-    max_notional = margin_avail * LEVERAGE * (MARGIN_USAGE_PCT / 100)
-    margin_units = int(max_notional / price_factor) if price_factor else 0
+    return {"pair": pair, "ok": True, "direction": direction, "confidence": round(conf, 1),
+            "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "atr": a,
+            "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-    units = min(risk_units, margin_units, MAX_UNITS)
-    capped_by = "risk"
-    if units == margin_units and margin_units < risk_units:
-        capped_by = "margin"
-    elif units == MAX_UNITS and MAX_UNITS < min(risk_units, margin_units):
-        capped_by = "max_units"
+# ---------------- EXECUTION ----------------
+def execute_signal(sig):
+    reset_daily()
+    pair = sig["pair"]
+    pnl = daily_pnl()
+    if DAILY["lockdown"] or pnl <= -abs(DAILY_LOSS_LIMIT):
+        DAILY["lockdown"] = True
+        logmsg(f"LOCKDOWN: daily loss limit hit (pnl {pnl:.2f} <= -{DAILY_LOSS_LIMIT})")
+        return {"executed": False, "reason": "daily loss lockdown"}
+    if DAILY["trades"] >= MAX_TRADES_DAY:
+        return {"executed": False, "reason": "max trades reached"}
+    if pair in DAILY["traded_pairs"]:
+        return {"executed": False, "reason": "pair already traded today"}
+    if pair in get_open_position_pairs():
+        return {"executed": False, "reason": "open position (FIFO)"}
 
-    return {
-        "units": max(0, units),
-        "risk_units": risk_units,
-        "margin_units": margin_units,
-        "margin_available": margin_avail,
-        "capped_by": capped_by,
-    }
+    acct = get_account()
+    sz = calc_units(pair, sig["price"], sig["stop_dist"], acct["balance"], acct["margin_available"])
+    if sz["units"] <= 0:
+        return {"executed": False, "reason": "zero units"}
 
+    res = place_market_order(pair, sig["direction"], sz["units"], sig["price"], sig["sl"], sig["tp"])
+    if res["ok"]:
+        DAILY["trades"] += 1
+        DAILY["traded_pairs"].append(pair)
+        u = sz["units"] if sig["direction"] == "LONG" else -sz["units"]
+        msg = (f"TRADE {sig['direction']} {pair} units={u} fill={res['fill']} "
+               f"sl={fmt_price(pair, sig['sl'])} tp={fmt_price(pair, sig['tp'])} "
+               f"conf={sig['confidence']}% (sized_by={sz['capped_by']})")
+        logmsg(msg)
+        tg(f"✅ {msg}")
+        return {"executed": True, "fill": res["fill"], "units": u, "sized_by": sz["capped_by"]}
+    else:
+        logmsg(f"REJECTED {pair}: {res['reason']}")
+        tg(f"⚠️ REJECTED {pair}: {res['reason']}")
+        return {"executed": False, "reason": res["reason"]}
 
-def reset_daily():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if STATE["daily"]["date"] != today:
-        start_bal = None
+def run_scan():
+    reset_daily()
+    results = []
+    for pair in PAIRS:
         try:
-            start_bal = get_balance()
+            sig = analyze_pair(pair)
+            if sig.get("ok"):
+                results.append(execute_signal(sig))
+            else:
+                results.append({"pair": pair, "skipped": sig.get("reason", "?")})
         except Exception as e:
-            log_event(f"start balance fetch failed: {e}")
-        STATE["daily"] = {
-            "date": today,
-            "trades": 0,
-            "start_balance": start_bal,
-            "traded_pairs": [],
-        }
+            logmsg(f"scan error {pair}: {e}")
+            results.append({"pair": pair, "error": str(e)})
+    return results
 
+# ---------------- SCANNER THREAD ----------------
+_cycle = [0]
+def scanner_loop():
+    while True:
+        try:
+            _cycle[0] += 1
+            if _cycle[0] % 8 == 1:
+                refresh_fred()
+            run_scan()
+        except Exception as e:
+            logmsg(f"scanner error: {e}")
+        time.sleep(SCAN_INTERVAL)
 
-def daily_pnl() -> float:
-    """v2.3: REAL realized P&L vs day-start balance."""
-    sb = STATE["daily"].get("start_balance")
-    if sb is None:
-        return 0.0
-    try:
-        return get_balance() - sb
-    except Exception:
-        return 0.0
+# ---------------- API ----------------
+app = FastAPI(title="ForexFlow EightFilter", version="2.4.0")
 
-
-# =============================
-# MODELS
-# =============================
 class VolumeUpdate(BaseModel):
     future: str
-    session_volume: Optional[int] = None
-    prev_volume: Optional[int] = None
-    net_change_pct: Optional[float] = None
-    open_interest: Optional[int] = None
-    note: Optional[str] = None
-
+    net_pct: float
 
 class CotUpdate(BaseModel):
     future: str
-    report_date: str
-    noncomm_long: int
-    noncomm_short: int
-    open_interest: Optional[int] = None
-
-
-class ManualTrade(BaseModel):
-    pair: str
-    direction: str
-
-
-# =============================
-# ENDPOINTS
-# =============================
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "version": "2.3.0",
-        "engine": "eight-filter",
-        "oanda": {
-            "env": OANDA_ENV,
-            "key_set": bool(OANDA_API_KEY),
-            "account_set": bool(OANDA_ACCOUNT_ID),
-        },
-        "fred_key_set": bool(FRED_API_KEY),
-        "auto_trade": AUTO_TRADE,
-        "max_units": MAX_UNITS,
-        "one_trade_per_pair": ONE_TRADE_PER_PAIR,
-        "pairs": list(PAIR_MAP.keys()),
-        "volume_loaded": list(STATE["volume"].keys()),
-        "cot_loaded": list(STATE["cot"].keys()),
-        "fred_loaded": list(STATE["fred"].keys()),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-@app.get("/balance")
-def balance():
-    try:
-        acct = get_account_summary()
-        return {
-            "balance": float(acct["balance"]),
-            "nav": float(acct.get("NAV", acct["balance"])),
-            "margin_available": float(acct.get("marginAvailable", 0)),
-            "unrealized_pl": float(acct.get("unrealizedPL", 0)),
-            "env": OANDA_ENV,
-            "status": "connected",
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/volume-update")
-def volume_update(v: VolumeUpdate):
-    STATE["volume"][v.future] = v.dict()
-    STATE["volume"][v.future]["updated_at"] = (
-        datetime.now(timezone.utc).isoformat()
-    )
-    log_event(f"Volume updated {v.future}: net {v.net_change_pct}%")
-    return {"saved": True, "future": v.future}
-
-
-@app.get("/volume-status")
-def volume_status():
-    return STATE["volume"]
-
-
-@app.post("/cot-update")
-def cot_update(c: CotUpdate):
-    net = c.noncomm_long - c.noncomm_short
-    STATE["cot"][c.future] = {
-        "report_date": c.report_date,
-        "noncomm_long": c.noncomm_long,
-        "noncomm_short": c.noncomm_short,
-        "net_noncommercial": net,
-        "open_interest": c.open_interest,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    log_event(f"COT updated {c.future}: net {net} (report {c.report_date})")
-    return {"saved": True, "future": c.future, "net_noncommercial": net}
-
-
-@app.get("/cot-status")
-def cot_status():
-    return STATE["cot"]
-
-
-@app.post("/fred-refresh")
-def fred_refresh():
-    if not FRED_API_KEY:
-        raise HTTPException(status_code=400, detail="FRED_API_KEY not set")
-    refresh_fred()
-    return {"fred": STATE["fred"]}
-
-
-@app.get("/fred-status")
-def fred_status():
-    return STATE["fred"]
-
-
-@app.get("/analyze/{pair}")
-def analyze(pair: str):
-    pair = pair.upper()
-    if pair not in PAIR_MAP:
-        raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    try:
-        return eight_filter_analyze(pair)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/scan")
-def scan():
-    reset_daily()
-    results = []
-    for pair in PAIR_MAP:
-        try:
-            results.append(eight_filter_analyze(pair))
-        except Exception as e:
-            results.append({"pair": pair, "proceed": False, "reason": str(e)})
-    d = dict(STATE["daily"])
-    d["realized_pnl"] = round(daily_pnl(), 2)
-    return {
-        "results": results,
-        "daily": d,
-        "auto_trade": AUTO_TRADE,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def execute_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
-    reset_daily()
-    daily = STATE["daily"]
-    pair = sig["pair"]
-
-    if daily["trades"] >= MAX_TRADES_PER_DAY:
-        return {"executed": False, "reason": "max trades per day reached"}
-
-    # v2.3: REAL loss-limit enforcement
-    pnl = daily_pnl()
-    if pnl <= -abs(DAILY_LOSS_LIMIT):
-        msg = f"daily loss limit hit (pnl {pnl:.2f} <= -{DAILY_LOSS_LIMIT})"
-        log_event("LOCKDOWN: " + msg)
-        return {"executed": False, "reason": msg}
-
-    if not sig.get("proceed"):
-        return {"executed": False, "reason": "signal not qualified"}
-
-    if ONE_TRADE_PER_PAIR and pair in daily.get("traded_pairs", []):
-        return {"executed": False, "reason": f"{pair} already traded today"}
-
-    open_pairs = get_open_position_pairs()
-    if pair in open_pairs:
-        return {"executed": False, "reason": f"{pair} position already open"}
-
-    balance_amt = get_balance()
-    sizing = calc_units(pair, sig["entry"], sig["stop_loss"], balance_amt)
-    units = sizing["units"]
-    if units < 1000:
-        return {"executed": False, "reason": f"sizing too small: {sizing}"}
-    if sig["direction"] == "SHORT":
-        units = -units
-
-    ok, resp, reason = place_market_order(
-        pair, units, sig["stop_loss"], sig["take_profit"]
-    )
-
-    if not ok:
-        msg = f"ORDER REJECTED {sig['direction']} {pair} units={units} — {reason}"
-        log_event(msg)
-        telegram("⚠️ " + msg)
-        return {"executed": False, "reason": reason, "oanda_response": resp}
-
-    daily["trades"] += 1
-    daily.setdefault("traded_pairs", []).append(pair)
-    fill = resp.get("orderFillTransaction", {})
-    fill_price = fill.get("price", sig["entry"])
-    msg = (
-        f"TRADE {sig['direction']} {pair} units={units} "
-        f"fill={fill_price} sl={sig['stop_loss']} tp={sig['take_profit']} "
-        f"conf={sig['confidence']}% (sized_by={sizing['capped_by']})"
-    )
-    log_event(msg)
-    telegram("✅ " + msg)
-    return {"executed": True, "fill_price": fill_price, "sizing": sizing,
-            "oanda_response": resp, "signal": sig}
-
-
-@app.post("/trade")
-def trade(t: ManualTrade):
-    pair = t.pair.upper()
-    if pair not in PAIR_MAP:
-        raise HTTPException(status_code=404, detail=f"Unknown pair {pair}")
-    sig = eight_filter_analyze(pair)
-    if t.direction.upper() != sig.get("direction"):
-        sig["direction"] = t.direction.upper()
-        sig["proceed"] = True
-    try:
-        return execute_signal(sig)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/auto-scan")
-def auto_scan():
-    results = scan()["results"]
-    executions = []
-    for sig in results:
-        if sig.get("proceed") and AUTO_TRADE:
-            try:
-                executions.append(execute_signal(sig))
-            except Exception as e:
-                executions.append({"executed": False, "reason": str(e)})
-    return {"results": results, "executions": executions}
-
-
-@app.get("/logs")
-def logs():
-    return STATE["log"]
-
-
-@app.get("/dashboard")
-def dashboard():
-    d = dict(STATE["daily"])
-    d["realized_pnl"] = round(daily_pnl(), 2)
-    d["loss_limit"] = DAILY_LOSS_LIMIT
-    return {
-        "daily": d,
-        "volume": STATE["volume"],
-        "cot": STATE["cot"],
-        "fred": STATE["fred"],
-        "recent_logs": STATE["log"][-20:],
-        "config": {
-            "risk_pct": RISK_PER_TRADE_PCT,
-            "max_trades": MAX_TRADES_PER_DAY,
-            "daily_loss_limit": DAILY_LOSS_LIMIT,
-            "min_confidence": MIN_CONFIDENCE,
-            "macro_block_pct": MACRO_BLOCK_PCT,
-            "max_units": MAX_UNITS,
-            "leverage": LEVERAGE,
-            "margin_usage_pct": MARGIN_USAGE_PCT,
-            "one_trade_per_pair": ONE_TRADE_PER_PAIR,
-            "auto_trade": AUTO_TRADE,
-            "env": OANDA_ENV,
-        },
-    }
-
-
-# =============================
-# BACKGROUND SCANNER
-# =============================
-def scanner_loop():
-    interval = int(os.getenv("SCAN_INTERVAL_SEC", "900"))
-    fred_counter = 0
-    while True:
-        time.sleep(interval)
-        try:
-            fred_counter += 1
-            if FRED_API_KEY and fred_counter >= 8:
-                fred_counter = 0
-                refresh_fred()
-            if AUTO_TRADE:
-                auto_scan()
-            else:
-                scan()
-        except Exception as e:
-            log_event(f"Scanner error: {e}")
-
+    net: float
 
 @app.on_event("startup")
 def startup():
-    if FRED_API_KEY:
-        try:
-            refresh_fred()
-        except Exception as e:
-            log_event(f"FRED startup refresh failed: {e}")
-    t = threading.Thread(target=scanner_loop, daemon=True)
-    t.start()
-    log_event("ForexFlow EightFilter v2.3 started")
+    logmsg("ForexFlow EightFilter v2.4.0 started (7 pairs, chop-skip)")
+    threading.Thread(target=scanner_loop, daemon=True).start()
+
+@app.get("/health")
+def health():
+    try:
+        acct = get_account()
+        return {"status": "ok", "version": "2.4.0", "env": OANDA_ENV,
+                "oanda": "connected", "balance": acct["balance"],
+                "auto_trade": AUTO_TRADE, "pairs": PAIRS}
+    except Exception as e:
+        return {"status": "degraded", "error": str(e)}
+
+@app.get("/balance")
+def balance():
+    a = get_account()
+    return {"balance": a["balance"], "nav": a["nav"],
+            "margin_available": a["margin_available"],
+            "unrealized_pl": a["unrealized_pl"], "env": OANDA_ENV, "status": "connected"}
+
+@app.get("/daily")
+def daily():
+    reset_daily()
+    return {"date": DAILY["date"], "trades": DAILY["trades"],
+            "start_balance": DAILY["start_balance"], "traded_pairs": DAILY["traded_pairs"],
+            "realized_pnl": round(daily_pnl(), 2), "loss_limit": DAILY_LOSS_LIMIT,
+            "lockdown": DAILY["lockdown"]}
+
+@app.post("/volume-update")
+def volume_update(v: VolumeUpdate):
+    VOLUME[v.future.upper()] = {"net_pct": v.net_pct, "ts": datetime.now(timezone.utc).isoformat()}
+    logmsg(f"Volume updated {v.future.upper()}: net {v.net_pct:+.2f}%")
+    return {"ok": True, "volume": VOLUME}
+
+@app.get("/volume-status")
+def volume_status():
+    return VOLUME
+
+@app.post("/cot-update")
+def cot_update(c: CotUpdate):
+    COT[c.future.upper()] = {"net": c.net, "ts": datetime.now(timezone.utc).isoformat()}
+    logmsg(f"COT updated {c.future.upper()}: net {c.net:+,.0f}")
+    return {"ok": True, "cot": COT}
+
+@app.get("/cot-status")
+def cot_status():
+    return COT
+
+@app.post("/fred-refresh")
+def fred_refresh():
+    refresh_fred()
+    return FRED
+
+@app.get("/fred-status")
+def fred_status():
+    return FRED
+
+@app.get("/analyze/{pair}")
+def analyze(pair: str):
+    if pair not in PAIR_MAP:
+        return {"error": f"unknown pair; valid: {PAIRS}"}
+    return analyze_pair(pair)
+
+@app.get("/scan")
+def scan():
+    return {"auto_trade": AUTO_TRADE, "results": run_scan()}
+
+@app.post("/trade")
+def trade(pair: str):
+    if pair not in PAIR_MAP:
+        return {"error": f"unknown pair; valid: {PAIRS}"}
+    sig = analyze_pair(pair)
+    if not sig.get("ok"):
+        return sig
+    return execute_signal(sig)
+
+@app.get("/logs")
+def logs():
+    return LOGS[-100:]
+
+@app.get("/dashboard")
+def dashboard():
+    reset_daily()
+    return {"version": "2.4.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+            "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
+                      "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
+                      "traded_pairs": DAILY["traded_pairs"]},
+            "volume": VOLUME, "cot": COT, "fred": FRED,
+            "chop_skip_min": CHOP_SKIP_MIN, "sessions": SESSIONS,
+            "recent_logs": LOGS[-20:]}

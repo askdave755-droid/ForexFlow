@@ -699,7 +699,8 @@ def ledger(limit: int = 50):
 
 @app.get("/backtest/pnl")
 def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
-                 gran: str = "M15", hold_bars: int = 96):
+                 gran: str = "M15", hold_bars: int = 96,
+                 from_year: int = 0, to_year: int = 9999):
     """Replay signal cores over real candles, all 7 pairs.
     core=trend|invert|revert|all. gran=M15|H1|H4 (friction shrinks as
     stops grow — M15 pays the spread toll, H1/H4 barely notice it).
@@ -713,6 +714,9 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
         try:
             tape[pair] = get_candles(pair, count=bars, gran=gran)
             spreads[pair] = get_quote(pair)["spread"]
+            if from_year or to_year != 9999:
+                tape[pair] = [c for c in tape[pair]
+                              if from_year <= int(c["t"][:4]) <= to_year]
         except Exception as e:
             errors[pair] = str(e)
     results = {}
@@ -724,7 +728,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[pair] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "2.6.2-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "2.6.3-backtest", "bars_per_pair": bars, "cores": cores,
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",

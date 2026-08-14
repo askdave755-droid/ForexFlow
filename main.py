@@ -1,8 +1,20 @@
 """
-ForexFlow EightFilter v2.6.0 — "The Bake-off"
+ForexFlow EightFilter v3.0.0 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
 
-New in v2.6.0:
+New in v3.0.0 — the first evidence-backed live core:
+  - LIVE ENGINE = USD/JPY DAILY trend (the split-sample survivor:
+    PF 1.30 in 2007-2016, PF 1.26 in 2017-2026, 412 trades over 19y)
+  - Signal: price_votes on D1 candles (F1 VWAP-dev, F2 EMA20/50, F4 RSI),
+    >=2 of 3 agree, fires once per new daily bar, holds for days
+  - Overlays at native speed: FRED DEXJPUS = daily macro VETO,
+    6J COT = weekly positioning VETO (inverted). Overlays can block,
+    never create — fidelity to the backtest is preserved.
+  - All 7 pairs remain available for /backtest/pnl research.
+  - All brakes unchanged: 1% risk, $500 daily lockdown, ledger,
+    outcome tracker, Telegram.
+
+v2.6.0:
   - /backtest/pnl?core=trend|invert|revert|all — three signal cores replayed
     side-by-side on the same 50 days x 7 pairs of real M15 candles:
       trend  = v2.5 core (F1/F2/F4 votes, 2:1 RR) — the proven-loser baseline
@@ -76,6 +88,9 @@ PAIR_MAP = {
 }
 PAIRS = list(PAIR_MAP.keys())
 VOTABLE = 6  # F1,F2,F3,F4,F7,F8 — F5 gates session, F6 gates EV
+LIVE_PAIR = "USD_JPY"          # v3.0: the split-sample survivor
+LAST_BAR = {}                  # pair -> last traded daily-bar date
+COT_VETO = 20000               # net positioning beyond this vs direction = veto
 
 # ---------------- LEDGER (SQLite) ----------------
 def db():
@@ -434,6 +449,71 @@ def analyze_pair(pair):
             "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
             "votes": [(v[0], v[1], v[2]) for v in votes]}
 
+# ---------------- LIVE DAILY CORE (v3.0 — mirrors the proven backtest) ----------------
+def analyze_daily(pair=LIVE_PAIR):
+    """USD/JPY daily trend: >=2 of 3 price votes agree on a NEW daily bar.
+    FRED + COT act as vetoes only (never create a trade)."""
+    cfg = PAIR_MAP[pair]
+    candles = get_candles(pair, count=60, gran="D")
+    if len(candles) < 30:
+        return {"pair": pair, "ok": False, "reason": "insufficient daily candles"}
+    bar_date = candles[-1]["t"][:10]
+    if LAST_BAR.get(pair) == bar_date:
+        return {"pair": pair, "ok": False, "reason": f"bar {bar_date} already evaluated"}
+    votes = price_votes(candles)
+    sc_l = sum(1 for v in votes if v[1] > 0)
+    sc_s = sum(1 for v in votes if v[1] < 0)
+    if max(sc_l, sc_s) < 2 or sc_l == sc_s:
+        ledger_signal(pair, "NONE", 0, [(v[0], v[1]) for v in votes], False, "daily: no 2-of-3 agreement")
+        LAST_BAR[pair] = bar_date
+        return {"pair": pair, "ok": False, "reason": "no 2-of-3 agreement",
+                "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
+    direction = "LONG" if sc_l > sc_s else "SHORT"
+    conf = max(sc_l, sc_s) / 3.0 * 100.0
+
+    # FRED macro veto (daily series, native speed at last)
+    fchg = FRED.get(pair)
+    if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
+        fred_dir = "LONG" if fchg > 0 else "SHORT"
+        if cfg["fred_up_means"] == "SHORT":
+            fred_dir = "SHORT" if fchg > 0 else "LONG"
+        if fred_dir != direction:
+            ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "fred veto")
+            LAST_BAR[pair] = bar_date
+            return {"pair": pair, "ok": False, "reason": f"FRED veto ({fchg:+.2f}% vs {direction})",
+                    "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
+
+    # COT positioning veto (weekly, inverted for 6J)
+    cot = COT.get(cfg["future"])
+    if cot is not None:
+        net = -cot["net"] if cfg["cot_invert"] else cot["net"]
+        if (direction == "LONG" and net < -COT_VETO) or (direction == "SHORT" and net > COT_VETO):
+            ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "cot veto")
+            LAST_BAR[pair] = bar_date
+            return {"pair": pair, "ok": False, "reason": f"COT veto ({cfg['future']} net {cot['net']:+,.0f} vs {direction})",
+                    "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
+
+    a = atr(candles)
+    if a <= 0:
+        return {"pair": pair, "ok": False, "reason": "ATR zero"}
+    stop_dist, tgt_dist = 1.5 * a, 3.0 * a
+    price = candles[-1]["c"]
+    try:
+        spread = get_quote(pair)["spread"]
+    except Exception:
+        spread = 0.0
+    if spread > 0 and stop_dist < SPREAD_STOP_MULT * spread:
+        return {"pair": pair, "ok": False, "reason": "EV gate (daily stop vs spread)"}
+
+    if direction == "LONG":
+        sl, tp = price - stop_dist, price + tgt_dist
+    else:
+        sl, tp = price + stop_dist, price - tgt_dist
+    LAST_BAR[pair] = bar_date  # one shot per daily bar, filled or not
+    return {"pair": pair, "ok": True, "direction": direction, "confidence": round(conf, 1),
+            "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
+            "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
+
 # ---------------- EXECUTION ----------------
 def execute_signal(sig):
     reset_daily()
@@ -477,18 +557,14 @@ def execute_signal(sig):
 def run_scan():
     reset_daily()
     track_open_trades()
-    results = []
-    for pair in PAIRS:
-        try:
-            sig = analyze_pair(pair)
-            if sig.get("ok"):
-                results.append(execute_signal(sig))
-            else:
-                results.append({"pair": pair, "skipped": sig.get("reason", "?")})
-        except Exception as e:
-            logmsg(f"scan error {pair}: {e}")
-            results.append({"pair": pair, "error": str(e)})
-    return results
+    try:
+        sig = analyze_daily(LIVE_PAIR)
+        if sig.get("ok"):
+            return [execute_signal(sig)]
+        return [{"pair": LIVE_PAIR, "skipped": sig.get("reason", "?"), "bar": sig.get("bar")}]
+    except Exception as e:
+        logmsg(f"scan error {LIVE_PAIR}: {e}")
+        return [{"pair": LIVE_PAIR, "error": str(e)}]
 
 # ---------------- BACKTEST (Kalshi-style /backtest/pnl) ----------------
 def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold_bars=96,
@@ -603,7 +679,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="2.6.0")
+app = FastAPI(title="ForexFlow EightFilter", version="3.0.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -616,14 +692,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v2.6.0 started (ledger + backtest + EV gate)")
+    logmsg("ForexFlow EightFilter v3.0.0 started (ledger + backtest + EV gate)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "2.6.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.0.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS}
     except Exception as e:
@@ -728,7 +804,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[pair] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "2.6.3-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.0.0-backtest", "bars_per_pair": bars, "cores": cores,
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",
@@ -743,7 +819,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "2.6.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+    return {"version": "3.0.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

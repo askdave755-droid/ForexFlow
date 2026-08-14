@@ -1,8 +1,16 @@
 """
-ForexFlow EightFilter v2.5.0 — "Ledger & Replay"
+ForexFlow EightFilter v2.6.0 — "The Bake-off"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
 
-New in v2.5.0 (Kalshi-cross-audit package):
+New in v2.6.0:
+  - /backtest/pnl?core=trend|invert|revert|all — three signal cores replayed
+    side-by-side on the same 50 days x 7 pairs of real M15 candles:
+      trend  = v2.5 core (F1/F2/F4 votes, 2:1 RR) — the proven-loser baseline
+      invert = same triggers, opposite direction (PF 0.74 backwards test)
+      revert = mean-reversion (fade RSI>70/<30 at VWAP stretch, 1:1 RR)
+    Data picks the winner before any more live trading.
+
+v2.5.0 (Kalshi-cross-audit package):
   1. REAL F6 EV gate: stop distance must be >= SPREAD_STOP_MULT x live spread.
      (Kalshi lesson: "friction, not signal, was the leak.")
   2. Confidence fix: F6 no longer votes (it gates). Denominator = 6 votable
@@ -483,46 +491,64 @@ def run_scan():
     return results
 
 # ---------------- BACKTEST (Kalshi-style /backtest/pnl) ----------------
-def backtest_pair(pair, candles, spread_est, risk_usd=1000.0):
-    """Replay F1/F2/F4 votes + F5 session gate + F6 spread gate over history.
-    Returns trade list in R multiples (1R = risk_usd)."""
-    trades = []  # (hour, pair, R)
-    cost_R = spread_est  # will be divided by stop_dist per trade
+def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend"):
+    """Replay a signal core over history. Returns trade list (hour, pair, R).
+    Cores:
+      trend  — F1/F2/F4 votes, >=2 agree, trade WITH majority, 2:1 RR
+      invert — same triggers, opposite direction
+      revert — fade RSI extremes at VWAP stretch, 1:1 RR"""
+    trades = []
     i = 60
     while i < len(candles) - 1:
         win = candles[i - 59:i + 1]
         h = hour_of(win[-1]["t"])
         if not in_session(h):
             i += 1; continue
-        votes = price_votes(win)
-        sl_votes = sum(1 for v in votes if v[1] > 0)
-        ss_votes = sum(1 for v in votes if v[1] < 0)
-        if max(sl_votes, ss_votes) < 2 or sl_votes == ss_votes:
-            i += 1; continue
-        direction = "LONG" if sl_votes > ss_votes else "SHORT"
+        closes = [c["c"] for c in win]
+        r_val = rsi(closes)
+        if core == "revert":
+            vw = vwap(win[-20:])
+            dev = (closes[-1] - vw) / vw * 100
+            if r_val > 70 and dev > 0.05:
+                direction = "SHORT"
+            elif r_val < 30 and dev < -0.05:
+                direction = "LONG"
+            else:
+                i += 1; continue
+            tp_mult = 1.0   # mean reversion: quick 1:1 target
+        else:
+            votes = price_votes(win)
+            sl_votes = sum(1 for v in votes if v[1] > 0)
+            ss_votes = sum(1 for v in votes if v[1] < 0)
+            if max(sl_votes, ss_votes) < 2 or sl_votes == ss_votes:
+                i += 1; continue
+            direction = "LONG" if sl_votes > ss_votes else "SHORT"
+            if core == "invert":
+                direction = "SHORT" if direction == "LONG" else "LONG"
+            tp_mult = 2.0
         a = atr(win)
         if a <= 0:
             i += 1; continue
         stop_dist = 1.5 * a
-        if stop_dist < SPREAD_STOP_MULT * cost_R:
+        if stop_dist < SPREAD_STOP_MULT * spread_est:
             i += 1; continue
         entry = candles[i]["c"]
-        cost_in_R = cost_R / stop_dist
+        cost_in_R = spread_est / stop_dist
         R = None; bars_held = 0
         for j in range(i + 1, min(i + 97, len(candles))):
             b = candles[j]; bars_held += 1
             if direction == "LONG":
                 hit_sl = b["l"] <= entry - stop_dist
-                hit_tp = b["h"] >= entry + 2 * stop_dist
+                hit_tp = b["h"] >= entry + tp_mult * stop_dist
             else:
                 hit_sl = b["h"] >= entry + stop_dist
-                hit_tp = b["l"] <= entry - 2 * stop_dist
+                hit_tp = b["l"] <= entry - tp_mult * stop_dist
             if hit_sl and hit_tp:
                 R = -1.0; break          # conservative: stop first
             if hit_sl:
                 R = -1.0; break
             if hit_tp:
-                R = 2.0; break
+                R = tp_mult; break
         if R is None:  # timeout exit at market
             exit_p = candles[min(i + 96, len(candles) - 1)]["c"]
             move = (exit_p - entry) if direction == "LONG" else (entry - exit_p)
@@ -576,7 +602,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="2.5.0")
+app = FastAPI(title="ForexFlow EightFilter", version="2.6.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -589,14 +615,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v2.5.0 started (ledger + backtest + EV gate)")
+    logmsg("ForexFlow EightFilter v2.6.0 started (ledger + backtest + EV gate)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "2.5.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "2.6.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS}
     except Exception as e:
@@ -671,28 +697,35 @@ def ledger(limit: int = 50):
     return {"grade": grade_live, "trades": trades, "signals": signals}
 
 @app.get("/backtest/pnl")
-def backtest_pnl(days: int = 50, risk_usd: float = 1000.0):
-    """Replay the price-action core (F1,F2,F4 + F5 session + F6 spread gate)
-    over real M15 candles, all 7 pairs. Volume/COT/FRED not backfillable —
+def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all"):
+    """Replay signal cores over real M15 candles, all 7 pairs.
+    core=trend|invert|revert|all. Volume/COT/FRED not backfillable —
     this grades the signal CORE. Spread = current live spread (constant)."""
     bars = max(500, min(5000, int(days * 96)))
-    all_trades, per_pair, errors = [], {}, {}
+    cores = ["trend", "invert", "revert"] if core == "all" else [core]
+    # fetch candles once per pair, replay every core on the same tape
+    tape, spreads, errors = {}, {}, {}
     for pair in PAIRS:
         try:
-            candles = get_candles(pair, count=bars)
-            spread = get_quote(pair)["spread"]
-            tr = backtest_pair(pair, candles, spread, risk_usd)
-            per_pair[pair] = grade(tr, risk_usd)
-            all_trades.extend(tr)
+            tape[pair] = get_candles(pair, count=bars)
+            spreads[pair] = get_quote(pair)["spread"]
         except Exception as e:
             errors[pair] = str(e)
-    return {"version": "2.5.0-backtest", "bars_per_pair": bars,
-            "assumptions": {"risk_per_trade_usd": risk_usd, "rr": "2:1",
+    results = {}
+    for c in cores:
+        all_trades, per_pair = [], {}
+        for pair, candles in tape.items():
+            tr = backtest_pair(pair, candles, spreads[pair], risk_usd, core=c)
+            per_pair[pair] = grade(tr, risk_usd)
+            all_trades.extend(tr)
+        results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
+    return {"version": "2.6.0-backtest", "bars_per_pair": bars, "cores": cores,
+            "assumptions": {"risk_per_trade_usd": risk_usd,
+                            "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",
                             "overlays_not_backfilled": ["F3 volume", "F7 COT", "F8 FRED"],
                             "same_bar_sl_tp": "stop assumed first (conservative)"},
-            "overall": grade(all_trades, risk_usd),
-            "per_pair": per_pair, "errors": errors}
+            "results": results, "errors": errors}
 
 @app.get("/logs")
 def logs():
@@ -701,7 +734,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "2.5.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+    return {"version": "2.6.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

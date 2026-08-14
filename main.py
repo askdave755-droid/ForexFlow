@@ -491,7 +491,7 @@ def run_scan():
     return results
 
 # ---------------- BACKTEST (Kalshi-style /backtest/pnl) ----------------
-def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend"):
+def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold_bars=96):
     """Replay a signal core over history. Returns trade list (hour, pair, R).
     Cores:
       trend  — F1/F2/F4 votes, >=2 agree, trade WITH majority, 2:1 RR
@@ -535,7 +535,7 @@ def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend"):
         entry = candles[i]["c"]
         cost_in_R = spread_est / stop_dist
         R = None; bars_held = 0
-        for j in range(i + 1, min(i + 97, len(candles))):
+        for j in range(i + 1, min(i + hold_bars + 1, len(candles))):
             b = candles[j]; bars_held += 1
             if direction == "LONG":
                 hit_sl = b["l"] <= entry - stop_dist
@@ -550,7 +550,7 @@ def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend"):
             if hit_tp:
                 R = tp_mult; break
         if R is None:  # timeout exit at market
-            exit_p = candles[min(i + 96, len(candles) - 1)]["c"]
+            exit_p = candles[min(i + hold_bars, len(candles) - 1)]["c"]
             move = (exit_p - entry) if direction == "LONG" else (entry - exit_p)
             R = move / stop_dist
         R -= cost_in_R
@@ -697,17 +697,20 @@ def ledger(limit: int = 50):
     return {"grade": grade_live, "trades": trades, "signals": signals}
 
 @app.get("/backtest/pnl")
-def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all"):
-    """Replay signal cores over real M15 candles, all 7 pairs.
-    core=trend|invert|revert|all. Volume/COT/FRED not backfillable —
-    this grades the signal CORE. Spread = current live spread (constant)."""
-    bars = max(500, min(5000, int(days * 96)))
+def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
+                 gran: str = "M15", hold_bars: int = 96):
+    """Replay signal cores over real candles, all 7 pairs.
+    core=trend|invert|revert|all. gran=M15|H1|H4 (friction shrinks as
+    stops grow — M15 pays the spread toll, H1/H4 barely notice it).
+    Volume/COT/FRED not backfillable. Spread = current live (constant)."""
+    bars_per_day = {"M15": 96, "H1": 24, "H4": 6}.get(gran, 96)
+    bars = max(500, min(5000, int(days * bars_per_day)))
     cores = ["trend", "invert", "revert"] if core == "all" else [core]
     # fetch candles once per pair, replay every core on the same tape
     tape, spreads, errors = {}, {}, {}
     for pair in PAIRS:
         try:
-            tape[pair] = get_candles(pair, count=bars)
+            tape[pair] = get_candles(pair, count=bars, gran=gran)
             spreads[pair] = get_quote(pair)["spread"]
         except Exception as e:
             errors[pair] = str(e)
@@ -715,11 +718,12 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all"):
     for c in cores:
         all_trades, per_pair = [], {}
         for pair, candles in tape.items():
-            tr = backtest_pair(pair, candles, spreads[pair], risk_usd, core=c)
+            tr = backtest_pair(pair, candles, spreads[pair], risk_usd, core=c,
+                               hold_bars=hold_bars)
             per_pair[pair] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "2.6.0-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "2.6.1-backtest", "bars_per_pair": bars, "cores": cores,
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",

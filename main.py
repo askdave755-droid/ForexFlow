@@ -245,8 +245,9 @@ def pip_value_per_unit(pair, price):
 
 def calc_units(pair, price, stop_dist, balance, margin_avail):
     risk_amt = balance * (RISK_PCT / 100.0)
-    pv = pip_value_per_unit(pair, price)
-    risk_units = int(risk_amt / (stop_dist * pv)) if pv > 0 else 0
+    pv = pip_value_per_unit(pair, price)           # USD per PIP per unit
+    stop_pips = stop_dist / PAIR_MAP[pair]["pip"]  # stop measured in pips
+    risk_units = int(risk_amt / (stop_pips * pv)) if pv > 0 and stop_pips > 0 else 0
     notional_per_unit = price if pair.endswith("_USD") else 1.0
     margin_units = int(margin_avail * LEVERAGE * (MARGIN_USAGE_PCT / 100.0) / notional_per_unit)
     units = min(risk_units, margin_units, MAX_UNITS)
@@ -518,6 +519,11 @@ def analyze_daily(pair=LIVE_PAIR):
 def execute_signal(sig):
     reset_daily()
     pair = sig["pair"]
+    if not AUTO_TRADE:
+        logmsg(f"AUTO_TRADE=false: signal {sig['direction']} {pair} conf={sig.get('confidence')}% NOT executed")
+        ledger_signal(pair, sig["direction"], sig.get("confidence", 0),
+                      [(v[0], v[1]) for v in sig.get("votes", [])], False, "auto_trade off")
+        return {"executed": False, "reason": "AUTO_TRADE is false (signal logged)"}
     pnl = daily_pnl()
     if DAILY["lockdown"] or pnl <= -abs(DAILY_LOSS_LIMIT):
         DAILY["lockdown"] = True
@@ -679,7 +685,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.0.0")
+app = FastAPI(title="ForexFlow EightFilter", version="3.0.1")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -692,14 +698,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.0.0 started (ledger + backtest + EV gate)")
+    logmsg("ForexFlow EightFilter v3.0.1 started (ledger + backtest + EV gate)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.0.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.0.1", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS}
     except Exception as e:
@@ -812,6 +818,21 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
                             "same_bar_sl_tp": "stop assumed first (conservative)"},
             "results": results, "errors": errors}
 
+@app.post("/close/{pair}")
+def close_position(pair: str):
+    """Emergency flatten: close any open position in pair."""
+    try:
+        d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/position/{pair}")
+        pos = d["position"]
+        body = {"longUnits": "ALL", "shortUnits": "ALL"}
+        r = requests.put(f"{BASE}/v3/accounts/{OANDA_ACCOUNT}/positions/{pair}/close",
+                         headers=HEADERS, json=body, timeout=15)
+        logmsg(f"MANUAL CLOSE {pair}: HTTP {r.status_code}")
+        tg(f"🔴 MANUAL CLOSE {pair}: HTTP {r.status_code}")
+        return r.json()
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/logs")
 def logs():
     return LOGS[-100:]
@@ -819,7 +840,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.0.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+    return {"version": "3.0.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

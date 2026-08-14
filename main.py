@@ -491,7 +491,8 @@ def run_scan():
     return results
 
 # ---------------- BACKTEST (Kalshi-style /backtest/pnl) ----------------
-def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold_bars=96):
+def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold_bars=96,
+                  skip_session=False):
     """Replay a signal core over history. Returns trade list (hour, pair, R).
     Cores:
       trend  — F1/F2/F4 votes, >=2 agree, trade WITH majority, 2:1 RR
@@ -502,7 +503,7 @@ def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold
     while i < len(candles) - 1:
         win = candles[i - 59:i + 1]
         h = hour_of(win[-1]["t"])
-        if not in_session(h):
+        if not skip_session and not in_session(h):
             i += 1; continue
         closes = [c["c"] for c in win]
         r_val = rsi(closes)
@@ -703,7 +704,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
     core=trend|invert|revert|all. gran=M15|H1|H4 (friction shrinks as
     stops grow — M15 pays the spread toll, H1/H4 barely notice it).
     Volume/COT/FRED not backfillable. Spread = current live (constant)."""
-    bars_per_day = {"M15": 96, "H1": 24, "H4": 6}.get(gran, 96)
+    bars_per_day = {"M15": 96, "H1": 24, "H4": 6, "D": 1}.get(gran, 96)
     bars = max(500, min(5000, int(days * bars_per_day)))
     cores = ["trend", "invert", "revert"] if core == "all" else [core]
     # fetch candles once per pair, replay every core on the same tape
@@ -719,11 +720,11 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
         all_trades, per_pair = [], {}
         for pair, candles in tape.items():
             tr = backtest_pair(pair, candles, spreads[pair], risk_usd, core=c,
-                               hold_bars=hold_bars)
+                               hold_bars=hold_bars, skip_session=(gran == "D"))
             per_pair[pair] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "2.6.1-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "2.6.2-backtest", "bars_per_pair": bars, "cores": cores,
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",

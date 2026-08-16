@@ -782,42 +782,49 @@ def ledger(limit: int = 50):
 @app.get("/backtest/pnl")
 def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
                  gran: str = "M15", hold_bars: int = 96,
-                 from_year: int = 0, to_year: int = 9999):
-    """Replay signal cores over real candles, all 7 pairs.
-    core=trend|invert|revert|all. gran=M15|H1|H4 (friction shrinks as
+                 from_year: int = 0, to_year: int = 9999,
+                 pair: str = ""):
+    """Replay signal cores over real candles.
+    core=trend|invert|revert|all. gran=M15|H1|H4|D (friction shrinks as
     stops grow — M15 pays the spread toll, H1/H4 barely notice it).
+    pair='' tests all 7 pairs (legacy blend — NOT what's live).
+    pair='USD_JPY' isolates the actual live engine's pair for an
+    apples-to-apples read against the daily core running in production.
     Volume/COT/FRED not backfillable. Spread = current live (constant)."""
+    if pair and pair not in PAIR_MAP:
+        return {"error": f"unknown pair; valid: {PAIRS}"}
+    test_pairs = [pair] if pair else PAIRS
+
     bars_per_day = {"M15": 96, "H1": 24, "H4": 6, "D": 1}.get(gran, 96)
     bars = max(500, min(5000, int(days * bars_per_day)))
     cores = ["trend", "invert", "revert"] if core == "all" else [core]
-    # fetch candles once per pair, replay every core on the same tape
     tape, spreads, errors = {}, {}, {}
-    for pair in PAIRS:
+    for p in test_pairs:
         try:
-            tape[pair] = get_candles(pair, count=bars, gran=gran)
-            spreads[pair] = get_quote(pair)["spread"]
+            tape[p] = get_candles(p, count=bars, gran=gran)
+            spreads[p] = get_quote(p)["spread"]
             if from_year or to_year != 9999:
-                tape[pair] = [c for c in tape[pair]
-                              if from_year <= int(c["t"][:4]) <= to_year]
+                tape[p] = [c for c in tape[p]
+                           if from_year <= int(c["t"][:4]) <= to_year]
         except Exception as e:
-            errors[pair] = str(e)
+            errors[p] = str(e)
     results = {}
     for c in cores:
         all_trades, per_pair = [], {}
-        for pair, candles in tape.items():
-            tr = backtest_pair(pair, candles, spreads[pair], risk_usd, core=c,
+        for p, candles in tape.items():
+            tr = backtest_pair(p, candles, spreads[p], risk_usd, core=c,
                                hold_bars=hold_bars, skip_session=(gran == "D"))
-            per_pair[pair] = grade(tr, risk_usd)
+            per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
     return {"version": "3.0.0-backtest", "bars_per_pair": bars, "cores": cores,
+            "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
                             "spread": "current live, held constant",
                             "overlays_not_backfilled": ["F3 volume", "F7 COT", "F8 FRED"],
                             "same_bar_sl_tp": "stop assumed first (conservative)"},
             "results": results, "errors": errors}
-
 @app.post("/close/{pair}")
 def close_position(pair: str):
     """Emergency flatten: close any open position in pair."""

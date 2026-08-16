@@ -1,6 +1,12 @@
 """
-ForexFlow EightFilter v3.2.0 — "Carry Trend"
+ForexFlow EightFilter v3.2.1 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
+
+v3.2.1 hotfix — AUTO-COT market names:
+  - CFTC renamed two CME markets; old names returned stale 2022 rows:
+      6B: "BRITISH POUND STERLING" -> "BRITISH POUND"
+      6N: "NEW ZEALAND DOLLAR"     -> "NZ DOLLAR"
+  - All 7 contracts now pull current weekly reports from the Socrata feed.
 
 v3.2.0 — AUTO-COT:
   - COT data now SELF-UPDATES from the CFTC's free public Socrata feed
@@ -87,12 +93,13 @@ LAST_BAR = {}                  # pair -> last traded daily-bar date
 COT_VETO = 20000               # net positioning beyond this vs direction = veto
 
 # CFTC legacy futures-only COT market names (Socrata dataset 6dca-aqww)
+# NOTE: names must match CFTC exactly — 6B/6N were renamed by CFTC (v3.2.1 fix)
 COT_MARKETS = {
     "6E": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
-    "6B": "BRITISH POUND STERLING - CHICAGO MERCANTILE EXCHANGE",
+    "6B": "BRITISH POUND - CHICAGO MERCANTILE EXCHANGE",
     "6J": "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
     "6A": "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
-    "6N": "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "6N": "NZ DOLLAR - CHICAGO MERCANTILE EXCHANGE",
     "6C": "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
     "6S": "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
 }
@@ -718,7 +725,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.2.0")
+app = FastAPI(title="ForexFlow EightFilter", version="3.2.1")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -731,14 +738,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.2.0 started (auto-COT)")
+    logmsg("ForexFlow EightFilter v3.2.1 started (auto-COT, market names fixed)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.2.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.2.1", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
     except Exception as e:
@@ -855,7 +862,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.2.0-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.2.1-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -893,7 +900,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.2.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
+    return {"version": "3.2.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

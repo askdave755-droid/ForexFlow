@@ -1,8 +1,22 @@
 """
-ForexFlow EightFilter v3.0.0 — "Carry Trend"
+ForexFlow EightFilter v3.1.0 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
 
-New in v3.0.0 — the first evidence-backed live core:
+New in v3.1.0:
+  - /backtest/pnl now takes a `pair` query param. pair="" (default) still
+    replays the old 6-pair-plus-USD/JPY blend for research/comparison.
+    pair="USD_JPY" isolates the ACTUAL live engine's pair — no more
+    accidentally grading the live system against six pairs that never
+    trade live (AUD/USD, NZD/USD, etc. are backtest-only relics of the
+    pre-v3.0 multi-pair scanner and are NOT connected to AUTO_TRADE).
+  - New /live-check endpoint: a zero-config wrapper pinned to LIVE_PAIR
+    on daily bars with the trend core. This is what should be checked
+    periodically to confirm the live signal still has edge — never the
+    7-pair blend, which the v2.6.0 comments below call out as
+    "the proven-loser baseline" on purpose (it's the benchmark the daily
+    core was built to beat, not something that should ever be live).
+
+v3.0.0 — the first evidence-backed live core:
   - LIVE ENGINE = USD/JPY DAILY trend (the split-sample survivor:
     PF 1.30 in 2007-2016, PF 1.26 in 2017-2026, 412 trades over 19y)
   - Signal: price_votes on D1 candles (F1 VWAP-dev, F2 EMA20/50, F4 RSI),
@@ -148,7 +162,6 @@ def track_open_trades():
         for tid, pair, direction, fill, ts_open in rows:
             if pair in open_pairs:
                 continue
-            # position gone -> find realized P&L from closed OANDA trades
             pnl = None
             try:
                 d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/trades?state=CLOSED&instrument={pair}&count=10")
@@ -245,8 +258,8 @@ def pip_value_per_unit(pair, price):
 
 def calc_units(pair, price, stop_dist, balance, margin_avail):
     risk_amt = balance * (RISK_PCT / 100.0)
-    pv = pip_value_per_unit(pair, price)           # USD per PIP per unit
-    stop_pips = stop_dist / PAIR_MAP[pair]["pip"]  # stop measured in pips
+    pv = pip_value_per_unit(pair, price)
+    stop_pips = stop_dist / PAIR_MAP[pair]["pip"]
     risk_units = int(risk_amt / (stop_pips * pv)) if pv > 0 and stop_pips > 0 else 0
     notional_per_unit = price if pair.endswith("_USD") else 1.0
     margin_units = int(margin_avail * LEVERAGE * (MARGIN_USAGE_PCT / 100.0) / notional_per_unit)
@@ -366,7 +379,6 @@ def analyze_pair(pair):
     price = candles[-1]["c"]
     votes = price_votes(candles)
 
-    # F3 futures volume
     fv = VOLUME.get(cfg["future"])
     if fv is None:
         votes.append(("F3_volume", 0, "no data"))
@@ -375,7 +387,6 @@ def analyze_pair(pair):
         votes.append(("F3_volume", 1 if net > 0.15 else (-1 if net < -0.15 else 0),
                       f"{cfg['future']} net {fv['net_pct']:+.2f}%"))
 
-    # F5 session gate
     now = datetime.now(timezone.utc)
     h = now.hour + now.minute / 60.0
     if not in_session(h):
@@ -383,7 +394,6 @@ def analyze_pair(pair):
         return {"pair": pair, "ok": False, "reason": "out of session (chop-skip or closed)",
                 "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-    # F7 COT
     cot = COT.get(cfg["future"])
     if cot is None:
         votes.append(("F7_cot", 0, "no data"))
@@ -392,7 +402,6 @@ def analyze_pair(pair):
         v = 1 if net > 20000 else (-1 if net < -20000 else 0)
         votes.append(("F7_cot", v, f"{cfg['future']} COT {cot['net']:+,.0f}"))
 
-    # F8 FRED
     fchg = FRED.get(pair)
     votes.append(("F8_fred", (1 if fchg > 0 else -1) if fchg is not None else 0,
                   f"5d {fchg:+.2f}%" if fchg is not None else "no data"))
@@ -406,7 +415,6 @@ def analyze_pair(pair):
     direction = "LONG" if score_long > score_short else "SHORT"
     conf = max(score_long, score_short) / VOTABLE * 100.0
 
-    # FRED macro veto
     if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
         fred_dir = "LONG" if fchg > 0 else "SHORT"
         if cfg["fred_up_means"] == "SHORT":
@@ -422,7 +430,6 @@ def analyze_pair(pair):
         return {"pair": pair, "ok": False, "reason": "ATR zero"}
     stop_dist, tgt_dist = 1.5 * a, 3.0 * a
 
-    # F6 EV gate: stop must clear SPREAD_STOP_MULT x live spread
     try:
         spread = get_quote(pair)["spread"]
     except Exception:
@@ -472,7 +479,6 @@ def analyze_daily(pair=LIVE_PAIR):
     direction = "LONG" if sc_l > sc_s else "SHORT"
     conf = max(sc_l, sc_s) / 3.0 * 100.0
 
-    # FRED macro veto (daily series, native speed at last)
     fchg = FRED.get(pair)
     if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
         fred_dir = "LONG" if fchg > 0 else "SHORT"
@@ -484,7 +490,6 @@ def analyze_daily(pair=LIVE_PAIR):
             return {"pair": pair, "ok": False, "reason": f"FRED veto ({fchg:+.2f}% vs {direction})",
                     "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
 
-    # COT positioning veto (weekly, inverted for 6J)
     cot = COT.get(cfg["future"])
     if cot is not None:
         net = -cot["net"] if cfg["cot_invert"] else cot["net"]
@@ -510,7 +515,7 @@ def analyze_daily(pair=LIVE_PAIR):
         sl, tp = price - stop_dist, price + tgt_dist
     else:
         sl, tp = price + stop_dist, price - tgt_dist
-    LAST_BAR[pair] = bar_date  # one shot per daily bar, filled or not
+    LAST_BAR[pair] = bar_date
     return {"pair": pair, "ok": True, "direction": direction, "confidence": round(conf, 1),
             "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
             "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
@@ -598,7 +603,7 @@ def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold
                 direction = "LONG"
             else:
                 i += 1; continue
-            tp_mult = 1.0   # mean reversion: quick 1:1 target
+            tp_mult = 1.0
         else:
             votes = price_votes(win)
             sl_votes = sum(1 for v in votes if v[1] > 0)
@@ -627,18 +632,18 @@ def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold
                 hit_sl = b["h"] >= entry + stop_dist
                 hit_tp = b["l"] <= entry - tp_mult * stop_dist
             if hit_sl and hit_tp:
-                R = -1.0; break          # conservative: stop first
+                R = -1.0; break
             if hit_sl:
                 R = -1.0; break
             if hit_tp:
                 R = tp_mult; break
-        if R is None:  # timeout exit at market
+        if R is None:
             exit_p = candles[min(i + hold_bars, len(candles) - 1)]["c"]
             move = (exit_p - entry) if direction == "LONG" else (entry - exit_p)
             R = move / stop_dist
         R -= cost_in_R
         trades.append((int(h), pair, R))
-        i += bars_held + 1  # no overlapping trades
+        i += bars_held + 1
     return trades
 
 def grade(trades, risk_usd=1000.0):
@@ -685,7 +690,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.0.1")
+app = FastAPI(title="ForexFlow EightFilter", version="3.1.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -698,16 +703,16 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.0.1 started (ledger + backtest + EV gate)")
+    logmsg("ForexFlow EightFilter v3.1.0 started (ledger + backtest + EV gate + pair-filtered backtest + live-check)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.0.1", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.1.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
-                "auto_trade": AUTO_TRADE, "pairs": PAIRS}
+                "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -787,9 +792,13 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
     """Replay signal cores over real candles.
     core=trend|invert|revert|all. gran=M15|H1|H4|D (friction shrinks as
     stops grow — M15 pays the spread toll, H1/H4 barely notice it).
-    pair='' tests all 7 pairs (legacy blend — NOT what's live).
-    pair='USD_JPY' isolates the actual live engine's pair for an
-    apples-to-apples read against the daily core running in production.
+    pair="" (default) tests all 7 pairs — the legacy multi-pair blend.
+    NOTE: six of those seven pairs are NOT connected to AUTO_TRADE and
+    never trade live. This mode is for research/comparison only — don't
+    use its `overall` block to judge whether the live system has edge.
+    pair="USD_JPY" isolates the actual live engine for an apples-to-apples
+    read against production. See also /live-check, which pins this
+    automatically to LIVE_PAIR with sensible defaults.
     Volume/COT/FRED not backfillable. Spread = current live (constant)."""
     if pair and pair not in PAIR_MAP:
         return {"error": f"unknown pair; valid: {PAIRS}"}
@@ -817,7 +826,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.0.0-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.1.0-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -825,6 +834,17 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
                             "overlays_not_backfilled": ["F3 volume", "F7 COT", "F8 FRED"],
                             "same_bar_sl_tp": "stop assumed first (conservative)"},
             "results": results, "errors": errors}
+
+@app.get("/live-check")
+def live_check(days: int = 1000, risk_usd: float = 1000.0):
+    """Zero-config health check for the ACTUAL live engine: always tests
+    LIVE_PAIR on daily bars with the trend core. No params to misconfigure
+    or misread — this is the one to hit periodically (or wire into a
+    monitoring cron) to confirm the live signal still has edge. Never use
+    the blended /backtest/pnl?pair= (default) number for this purpose."""
+    return backtest_pnl(days=days, risk_usd=risk_usd, core="trend",
+                        gran="D", hold_bars=96, pair=LIVE_PAIR)
+
 @app.post("/close/{pair}")
 def close_position(pair: str):
     """Emergency flatten: close any open position in pair."""
@@ -847,7 +867,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.0.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+    return {"version": "3.1.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

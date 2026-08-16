@@ -1,6 +1,10 @@
 """
-ForexFlow EightFilter v3.1.0 — "Carry Trend"
+ForexFlow EightFilter v3.1.1 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
+
+v3.1.1 hotfix:
+  - /close/{pair}: OANDA path fixed /position/ -> /positions/ (404 bug;
+    reverted accidentally in the v3.1.0 revamp). Emergency flatten works again.
 
 New in v3.1.0:
   - /backtest/pnl now takes a `pair` query param. pair="" (default) still
@@ -690,7 +694,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.1.0")
+app = FastAPI(title="ForexFlow EightFilter", version="3.1.1")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -703,14 +707,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.1.0 started (ledger + backtest + EV gate + pair-filtered backtest + live-check)")
+    logmsg("ForexFlow EightFilter v3.1.1 started (close-endpoint path fix)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.1.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.1.1", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
     except Exception as e:
@@ -826,7 +830,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.1.0-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.1.1-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -849,7 +853,7 @@ def live_check(days: int = 1000, risk_usd: float = 1000.0):
 def close_position(pair: str):
     """Emergency flatten: close any open position in pair."""
     try:
-        d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/position/{pair}")
+        d = oanda_get(f"/v3/accounts/{OANDA_ACCOUNT}/positions/{pair}")
         pos = d["position"]
         body = {"longUnits": "ALL", "shortUnits": "ALL"}
         r = requests.put(f"{BASE}/v3/accounts/{OANDA_ACCOUNT}/positions/{pair}/close",
@@ -867,7 +871,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.1.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
+    return {"version": "3.1.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

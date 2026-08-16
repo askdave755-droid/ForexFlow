@@ -1,57 +1,32 @@
 """
-ForexFlow EightFilter v3.1.1 — "Carry Trend"
+ForexFlow EightFilter v3.2.0 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
+
+v3.2.0 — AUTO-COT:
+  - COT data now SELF-UPDATES from the CFTC's free public Socrata feed
+    (publicreporting.cftc.gov, legacy futures-only report, no API key).
+  - maybe_refresh_cot() runs on scanner cycles, throttled to 12h; pulls
+    net non-commercial positioning for all 7 CME FX contracts and stores
+    report_date + source="cftc-auto". Manual /cot-update still works and
+    overrides. /cot-refresh forces a pull on demand.
+  - The Friday screenshot ritual is retired. (Volume stays manual —
+    CME futures volume has no free public API; that one is real.)
 
 v3.1.1 hotfix:
   - /close/{pair}: OANDA path fixed /position/ -> /positions/ (404 bug;
     reverted accidentally in the v3.1.0 revamp). Emergency flatten works again.
 
-New in v3.1.0:
-  - /backtest/pnl now takes a `pair` query param. pair="" (default) still
-    replays the old 6-pair-plus-USD/JPY blend for research/comparison.
-    pair="USD_JPY" isolates the ACTUAL live engine's pair — no more
-    accidentally grading the live system against six pairs that never
-    trade live (AUD/USD, NZD/USD, etc. are backtest-only relics of the
-    pre-v3.0 multi-pair scanner and are NOT connected to AUTO_TRADE).
-  - New /live-check endpoint: a zero-config wrapper pinned to LIVE_PAIR
-    on daily bars with the trend core. This is what should be checked
-    periodically to confirm the live signal still has edge — never the
-    7-pair blend, which the v2.6.0 comments below call out as
-    "the proven-loser baseline" on purpose (it's the benchmark the daily
-    core was built to beat, not something that should ever be live).
+v3.1.0:
+  - /backtest/pnl `pair` query param + /live-check endpoint pinned to
+    LIVE_PAIR (trend core, daily bars). The 7-pair blend is research-only.
 
 v3.0.0 — the first evidence-backed live core:
   - LIVE ENGINE = USD/JPY DAILY trend (the split-sample survivor:
     PF 1.30 in 2007-2016, PF 1.26 in 2017-2026, 412 trades over 19y)
-  - Signal: price_votes on D1 candles (F1 VWAP-dev, F2 EMA20/50, F4 RSI),
-    >=2 of 3 agree, fires once per new daily bar, holds for days
-  - Overlays at native speed: FRED DEXJPUS = daily macro VETO,
-    6J COT = weekly positioning VETO (inverted). Overlays can block,
-    never create — fidelity to the backtest is preserved.
-  - All 7 pairs remain available for /backtest/pnl research.
+  - Signal: price_votes on D1 candles, >=2 of 3 agree, once per daily bar
+  - Overlays: FRED DEXJPUS = daily macro VETO, 6J COT = weekly VETO
   - All brakes unchanged: 1% risk, $500 daily lockdown, ledger,
     outcome tracker, Telegram.
-
-v2.6.0:
-  - /backtest/pnl?core=trend|invert|revert|all — three signal cores replayed
-    side-by-side on the same 50 days x 7 pairs of real M15 candles:
-      trend  = v2.5 core (F1/F2/F4 votes, 2:1 RR) — the proven-loser baseline
-      invert = same triggers, opposite direction (PF 0.74 backwards test)
-      revert = mean-reversion (fade RSI>70/<30 at VWAP stretch, 1:1 RR)
-    Data picks the winner before any more live trading.
-
-v2.5.0 (Kalshi-cross-audit package):
-  1. REAL F6 EV gate: stop distance must be >= SPREAD_STOP_MULT x live spread.
-     (Kalshi lesson: "friction, not signal, was the leak.")
-  2. Confidence fix: F6 no longer votes (it gates). Denominator = 6 votable
-     filters (F1,F2,F3,F4,F7,F8). 65% = 4/6 agreement. Kills phantom-100% bug.
-  3. SQLite ledger: every signal + fill + outcome journaled (survives restarts
-     within a deploy; wiped on redeploy — /ledger exports anytime).
-  4. Outcome tracker: open ledger trades auto-closed vs OANDA realizedPL,
-     Telegram on every result.
-  5. /backtest/pnl: replays the price-action core (F1,F2,F4,F5,F6) over ~50
-     days of real M15 candles x 7 pairs, with spread cost, 1% risk, 2:1 RR.
-     Reports WR, PF, maxDD, per-pair, per-hour — the Kalshi-style grade card.
 
 Eight filters:
   F1 VWAP dev | F2 EMA20/50 | F3 CME volume | F4 RSI | F5 session (chop-skip)
@@ -88,6 +63,7 @@ LEVERAGE          = float(os.getenv("LEVERAGE", "30"))
 MARGIN_USAGE_PCT  = float(os.getenv("MARGIN_USAGE_PCT", "50"))
 CHOP_SKIP_MIN     = int(os.getenv("CHOP_SKIP_MIN", "30"))
 SPREAD_STOP_MULT  = float(os.getenv("SPREAD_STOP_MULT", "3.0"))  # F6: stop >= 3x spread
+COT_REFRESH_SEC   = int(os.getenv("COT_REFRESH_SEC", "43200"))   # auto-COT every 12h
 DB_PATH           = os.getenv("LEDGER_DB", "forexflow_ledger.db")
 
 BASE = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
@@ -109,6 +85,19 @@ VOTABLE = 6  # F1,F2,F3,F4,F7,F8 — F5 gates session, F6 gates EV
 LIVE_PAIR = "USD_JPY"          # v3.0: the split-sample survivor
 LAST_BAR = {}                  # pair -> last traded daily-bar date
 COT_VETO = 20000               # net positioning beyond this vs direction = veto
+
+# CFTC legacy futures-only COT market names (Socrata dataset 6dca-aqww)
+COT_MARKETS = {
+    "6E": "EURO FX - CHICAGO MERCANTILE EXCHANGE",
+    "6B": "BRITISH POUND STERLING - CHICAGO MERCANTILE EXCHANGE",
+    "6J": "JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE",
+    "6A": "AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "6N": "NEW ZEALAND DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "6C": "CANADIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE",
+    "6S": "SWISS FRANC - CHICAGO MERCANTILE EXCHANGE",
+}
+COT_URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+COT_LAST_PULL = [0.0]
 
 # ---------------- LEDGER (SQLite) ----------------
 def db():
@@ -357,6 +346,40 @@ def refresh_fred():
             FRED[pair] = round(chg, 2)
             logmsg(f"FRED {pair} ({cfg['fred_series']}): 5d {chg:+.2f}%")
 
+# ---------------- AUTO-COT (CFTC Socrata, free public feed) ----------------
+def fetch_cot():
+    """Pull latest net non-commercial positioning for all 7 CME FX contracts."""
+    pulled = 0
+    for code, name in COT_MARKETS.items():
+        try:
+            r = requests.get(COT_URL,
+                             params={"market_and_exchange_names": name,
+                                     "$order": "report_date_as_yyyy_mm_dd DESC",
+                                     "$limit": 1},
+                             headers={"User-Agent": "ForexFlow/3.2 (personal research bot)"},
+                             timeout=20)
+            d = r.json()
+            if not isinstance(d, list) or not d:
+                logmsg(f"COT auto {code}: no rows for '{name}' (check market name)")
+                continue
+            row = d[0]
+            net = int(float(row["noncomm_positions_long_all"])) - int(float(row["noncomm_positions_short_all"]))
+            rep = str(row.get("report_date_as_yyyy_mm_dd", ""))[:10]
+            COT[code] = {"net": net, "ts": datetime.now(timezone.utc).isoformat(),
+                         "report_date": rep, "source": "cftc-auto"}
+            logmsg(f"COT auto {code}: net {net:+,} (report {rep})")
+            pulled += 1
+        except Exception as e:
+            logmsg(f"COT auto error {code}: {e}")
+    if pulled:
+        tg(f"📊 COT auto-update: {pulled}/7 contracts pulled from CFTC")
+    return pulled
+
+def maybe_refresh_cot():
+    if time.time() - COT_LAST_PULL[0] >= COT_REFRESH_SEC:
+        COT_LAST_PULL[0] = time.time()
+        fetch_cot()
+
 # ---------------- CORE PRICE FILTERS (shared by live + backtest) ----------------
 def price_votes(candles):
     """F1/F2/F4 votes from candles alone. Returns list of (name, vote, note)."""
@@ -374,7 +397,7 @@ def price_votes(candles):
     else: votes.append(("F4_rsi", 0, f"RSI {r:.0f}"))
     return votes
 
-# ---------------- LIVE EIGHT-FILTER ENGINE ----------------
+# ---------------- LIVE EIGHT-FILTER ENGINE (research path) ----------------
 def analyze_pair(pair):
     cfg = PAIR_MAP[pair]
     candles = get_candles(pair)
@@ -688,13 +711,14 @@ def scanner_loop():
             _cycle[0] += 1
             if _cycle[0] % 8 == 1:
                 refresh_fred()
+            maybe_refresh_cot()
             run_scan()
         except Exception as e:
             logmsg(f"scanner error: {e}")
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.1.1")
+app = FastAPI(title="ForexFlow EightFilter", version="3.2.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -707,14 +731,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.1.1 started (close-endpoint path fix)")
+    logmsg("ForexFlow EightFilter v3.2.0 started (auto-COT)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.1.1", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.2.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
     except Exception as e:
@@ -747,9 +771,16 @@ def volume_status():
 
 @app.post("/cot-update")
 def cot_update(c: CotUpdate):
-    COT[c.future.upper()] = {"net": c.net, "ts": datetime.now(timezone.utc).isoformat()}
-    logmsg(f"COT updated {c.future.upper()}: net {c.net:+,.0f}")
+    COT[c.future.upper()] = {"net": c.net, "ts": datetime.now(timezone.utc).isoformat(),
+                             "source": "manual"}
+    logmsg(f"COT updated {c.future.upper()}: net {c.net:+,.0f} (manual)")
     return {"ok": True, "cot": COT}
+
+@app.post("/cot-refresh")
+def cot_refresh():
+    pulled = fetch_cot()
+    COT_LAST_PULL[0] = time.time()
+    return {"pulled": pulled, "cot": COT}
 
 @app.get("/cot-status")
 def cot_status():
@@ -794,15 +825,9 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
                  from_year: int = 0, to_year: int = 9999,
                  pair: str = ""):
     """Replay signal cores over real candles.
-    core=trend|invert|revert|all. gran=M15|H1|H4|D (friction shrinks as
-    stops grow — M15 pays the spread toll, H1/H4 barely notice it).
-    pair="" (default) tests all 7 pairs — the legacy multi-pair blend.
-    NOTE: six of those seven pairs are NOT connected to AUTO_TRADE and
-    never trade live. This mode is for research/comparison only — don't
-    use its `overall` block to judge whether the live system has edge.
-    pair="USD_JPY" isolates the actual live engine for an apples-to-apples
-    read against production. See also /live-check, which pins this
-    automatically to LIVE_PAIR with sensible defaults.
+    core=trend|invert|revert|all. gran=M15|H1|H4|D.
+    pair="" (default) tests all 7 pairs — research/comparison only.
+    pair="USD_JPY" isolates the actual live engine. See /live-check.
     Volume/COT/FRED not backfillable. Spread = current live (constant)."""
     if pair and pair not in PAIR_MAP:
         return {"error": f"unknown pair; valid: {PAIRS}"}
@@ -830,7 +855,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.1.1-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.2.0-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -842,10 +867,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
 @app.get("/live-check")
 def live_check(days: int = 1000, risk_usd: float = 1000.0):
     """Zero-config health check for the ACTUAL live engine: always tests
-    LIVE_PAIR on daily bars with the trend core. No params to misconfigure
-    or misread — this is the one to hit periodically (or wire into a
-    monitoring cron) to confirm the live signal still has edge. Never use
-    the blended /backtest/pnl?pair= (default) number for this purpose."""
+    LIVE_PAIR on daily bars with the trend core."""
     return backtest_pnl(days=days, risk_usd=risk_usd, core="trend",
                         gran="D", hold_bars=96, pair=LIVE_PAIR)
 
@@ -871,7 +893,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.1.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
+    return {"version": "3.2.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

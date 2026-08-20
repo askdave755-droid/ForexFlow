@@ -1,38 +1,33 @@
 """
-ForexFlow EightFilter v3.2.1 — "Carry Trend"
+ForexFlow EightFilter v3.3.0 — "Carry Trend"
 Institutional-style forex signal engine — 7 CME-futures-backed pairs.
+
+v3.3.0 — VETO EVIDENCE + TRANSPARENCY:
+  - /backtest/vetoes: 19-year backfill backtest. Pulls FULL COT history
+    (CFTC Socrata, weekly since ~2006) and FULL FRED daily history, then
+    replays the daily trend core on each of the 7 pairs under 4 variants:
+      core  — price votes only (no overlays)
+      fred  — core + FRED macro veto
+      cot   — core + COT positioning veto
+      both  — core + FRED + COT vetoes (the live config)
+    Answers with data: do the vetoes add EV? Which pairs clear PF 1.2?
+  - Telegram now alerts on EVERY daily decision: trade, veto (which one
+    and why), or pass (no 2-of-3 agreement). Watch it think.
 
 v3.2.1 hotfix — AUTO-COT market names:
   - CFTC renamed two CME markets; old names returned stale 2022 rows:
       6B: "BRITISH POUND STERLING" -> "BRITISH POUND"
       6N: "NEW ZEALAND DOLLAR"     -> "NZ DOLLAR"
-  - All 7 contracts now pull current weekly reports from the Socrata feed.
 
 v3.2.0 — AUTO-COT:
-  - COT data now SELF-UPDATES from the CFTC's free public Socrata feed
-    (publicreporting.cftc.gov, legacy futures-only report, no API key).
-  - maybe_refresh_cot() runs on scanner cycles, throttled to 12h; pulls
-    net non-commercial positioning for all 7 CME FX contracts and stores
-    report_date + source="cftc-auto". Manual /cot-update still works and
-    overrides. /cot-refresh forces a pull on demand.
-  - The Friday screenshot ritual is retired. (Volume stays manual —
-    CME futures volume has no free public API; that one is real.)
+  - COT self-updates from CFTC Socrata (no key), 12h throttle, /cot-refresh.
+  - Volume stays manual (no free CME volume API).
 
-v3.1.1 hotfix:
-  - /close/{pair}: OANDA path fixed /position/ -> /positions/ (404 bug;
-    reverted accidentally in the v3.1.0 revamp). Emergency flatten works again.
-
-v3.1.0:
-  - /backtest/pnl `pair` query param + /live-check endpoint pinned to
-    LIVE_PAIR (trend core, daily bars). The 7-pair blend is research-only.
-
-v3.0.0 — the first evidence-backed live core:
-  - LIVE ENGINE = USD/JPY DAILY trend (the split-sample survivor:
-    PF 1.30 in 2007-2016, PF 1.26 in 2017-2026, 412 trades over 19y)
-  - Signal: price_votes on D1 candles, >=2 of 3 agree, once per daily bar
-  - Overlays: FRED DEXJPUS = daily macro VETO, 6J COT = weekly VETO
-  - All brakes unchanged: 1% risk, $500 daily lockdown, ledger,
-    outcome tracker, Telegram.
+v3.1.1 hotfix: /close/{pair} OANDA path /position/ -> /positions/.
+v3.1.0: /backtest/pnl pair param + /live-check pinned to LIVE_PAIR.
+v3.0.0 — evidence-backed live core: USD/JPY DAILY trend
+  (PF 1.30 2007-2016, PF 1.26 2017-2026, 412 trades/19y), >=2 of 3 votes,
+  FRED + COT vetoes, 1% risk, $500 daily lockdown, ledger, Telegram.
 
 Eight filters:
   F1 VWAP dev | F2 EMA20/50 | F3 CME volume | F4 RSI | F5 session (chop-skip)
@@ -41,6 +36,7 @@ Risk: 1%/trade, max 3/day, $500 daily loss LOCKDOWN, margin-aware sizing,
       FIFO-safe, one trade per pair per day.
 """
 import os, time, math, threading, logging, sqlite3, json, statistics
+from bisect import bisect_right
 from datetime import datetime, timezone, date
 import requests
 from fastapi import FastAPI
@@ -363,7 +359,7 @@ def fetch_cot():
                              params={"market_and_exchange_names": name,
                                      "$order": "report_date_as_yyyy_mm_dd DESC",
                                      "$limit": 1},
-                             headers={"User-Agent": "ForexFlow/3.2 (personal research bot)"},
+                             headers={"User-Agent": "ForexFlow/3.3 (personal research bot)"},
                              timeout=20)
             d = r.json()
             if not isinstance(d, list) or not d:
@@ -386,6 +382,139 @@ def maybe_refresh_cot():
     if time.time() - COT_LAST_PULL[0] >= COT_REFRESH_SEC:
         COT_LAST_PULL[0] = time.time()
         fetch_cot()
+
+# ---------------- HISTORICAL BACKFILL (veto evidence engine) ----------------
+HIST = {"cot": {}, "fred": {}, "ts": 0.0}   # cached in-memory; refresh hourly
+
+def fetch_cot_history():
+    """Full weekly net-position history per contract: [(date, net), ...] ASC."""
+    out = {}
+    for code, name in COT_MARKETS.items():
+        try:
+            r = requests.get(COT_URL,
+                             params={"market_and_exchange_names": name,
+                                     "$select": "report_date_as_yyyy_mm_dd,noncomm_positions_long_all,noncomm_positions_short_all",
+                                     "$order": "report_date_as_yyyy_mm_dd ASC",
+                                     "$limit": 50000},
+                             headers={"User-Agent": "ForexFlow/3.3 (personal research bot)"},
+                             timeout=60)
+            rows = r.json()
+            if not isinstance(rows, list):
+                continue
+            out[code] = [(str(x["report_date_as_yyyy_mm_dd"])[:10],
+                          int(float(x["noncomm_positions_long_all"])) - int(float(x["noncomm_positions_short_all"])))
+                         for x in rows]
+            logmsg(f"COT history {code}: {len(out[code])} weeks ({out[code][0][0]} -> {out[code][-1][0]})")
+        except Exception as e:
+            logmsg(f"COT history error {code}: {e}")
+    return out
+
+def fetch_fred_history():
+    """Full daily history per pair: [(date, value), ...] ASC."""
+    out = {}
+    if not FRED_API_KEY:
+        return out
+    for pair, cfg in PAIR_MAP.items():
+        try:
+            r = requests.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": cfg["fred_series"], "api_key": FRED_API_KEY,
+                                     "file_type": "json", "observation_start": "2006-01-01"},
+                             timeout=60)
+            obs = [(o["date"], float(o["value"])) for o in r.json().get("observations", [])
+                   if o["value"] not in (".", "")]
+            out[pair] = obs
+            logmsg(f"FRED history {pair} ({cfg['fred_series']}): {len(obs)} days")
+        except Exception as e:
+            logmsg(f"FRED history error {pair}: {e}")
+    return out
+
+def refresh_hist(force=False):
+    if force or time.time() - HIST["ts"] > 3600 or not HIST["cot"]:
+        HIST["cot"] = fetch_cot_history()
+        HIST["fred"] = fetch_fred_history()
+        HIST["ts"] = time.time()
+
+def hist_lookup(series, d):
+    """Latest value in [(date,val),...] ASC with date <= d. None if before start."""
+    if not series:
+        return None
+    dates = [x[0] for x in series]
+    i = bisect_right(dates, d) - 1
+    return series[i][1] if i >= 0 else None
+
+def fred_chg_on(series, d, lag=5):
+    """5-observation % change of a FRED daily series as of date d (or None)."""
+    if not series:
+        return None
+    dates = [x[0] for x in series]
+    i = bisect_right(dates, d) - 1
+    if i < lag:
+        return None
+    now, prev = series[i][1], series[i - lag][1]
+    return (now - prev) / prev * 100.0 if prev else None
+
+def backtest_daily_veto(pair, candles, spread_est, cot_hist, fred_hist, variant):
+    """Replay the LIVE daily core on daily bars with historical vetoes.
+    variant: core | fred | cot | both. Returns list of R multiples."""
+    cfg = PAIR_MAP[pair]
+    cot_series = cot_hist.get(cfg["future"], [])
+    fred_series = fred_hist.get(pair, [])
+    trades = []
+    i = 60
+    while i < len(candles) - 1:
+        win = candles[i - 59:i + 1]
+        d = win[-1]["t"][:10]
+        votes = price_votes(win)
+        sl_v = sum(1 for v in votes if v[1] > 0)
+        ss_v = sum(1 for v in votes if v[1] < 0)
+        if max(sl_v, ss_v) < 2 or sl_v == ss_v:
+            i += 1; continue
+        direction = "LONG" if sl_v > ss_v else "SHORT"
+
+        if variant in ("fred", "both"):
+            fchg = fred_chg_on(fred_series, d)
+            if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
+                fred_dir = "LONG" if fchg > 0 else "SHORT"
+                if cfg["fred_up_means"] == "SHORT":
+                    fred_dir = "SHORT" if fchg > 0 else "LONG"
+                if fred_dir != direction:
+                    i += 1; continue
+        if variant in ("cot", "both"):
+            net = hist_lookup(cot_series, d)
+            if net is not None:
+                n = -net if cfg["cot_invert"] else net
+                if (direction == "LONG" and n < -COT_VETO) or (direction == "SHORT" and n > COT_VETO):
+                    i += 1; continue
+
+        a = atr(win)
+        if a <= 0:
+            i += 1; continue
+        stop_dist = 1.5 * a
+        if stop_dist < SPREAD_STOP_MULT * spread_est:
+            i += 1; continue
+        entry = candles[i]["c"]
+        cost_in_R = spread_est / stop_dist
+        R = None; bars_held = 0
+        for j in range(i + 1, min(i + 97, len(candles))):
+            b = candles[j]; bars_held += 1
+            if direction == "LONG":
+                hit_sl = b["l"] <= entry - stop_dist
+                hit_tp = b["h"] >= entry + 2.0 * stop_dist
+            else:
+                hit_sl = b["h"] >= entry + stop_dist
+                hit_tp = b["l"] <= entry - 2.0 * stop_dist
+            if hit_sl or (hit_sl and hit_tp):
+                R = -1.0; break
+            if hit_tp:
+                R = 2.0; break
+        if R is None:
+            exit_p = candles[min(i + 96, len(candles) - 1)]["c"]
+            move = (exit_p - entry) if direction == "LONG" else (entry - exit_p)
+            R = move / stop_dist
+        R -= cost_in_R
+        trades.append((0, pair, R))
+        i += bars_held + 1
+    return trades
 
 # ---------------- CORE PRICE FILTERS (shared by live + backtest) ----------------
 def price_votes(candles):
@@ -494,7 +623,8 @@ def analyze_pair(pair):
 # ---------------- LIVE DAILY CORE (v3.0 — mirrors the proven backtest) ----------------
 def analyze_daily(pair=LIVE_PAIR):
     """USD/JPY daily trend: >=2 of 3 price votes agree on a NEW daily bar.
-    FRED + COT act as vetoes only (never create a trade)."""
+    FRED + COT act as vetoes only (never create a trade).
+    v3.3: every decision (trade / veto / pass) goes to Telegram."""
     cfg = PAIR_MAP[pair]
     candles = get_candles(pair, count=60, gran="D")
     if len(candles) < 30:
@@ -508,6 +638,8 @@ def analyze_daily(pair=LIVE_PAIR):
     if max(sc_l, sc_s) < 2 or sc_l == sc_s:
         ledger_signal(pair, "NONE", 0, [(v[0], v[1]) for v in votes], False, "daily: no 2-of-3 agreement")
         LAST_BAR[pair] = bar_date
+        vtxt = ", ".join(f"{v[0]}={v[1]:+d}" for v in votes)
+        tg(f"⚪ PASS {pair} daily bar {bar_date}: no 2-of-3 agreement ({vtxt}). No trade.")
         return {"pair": pair, "ok": False, "reason": "no 2-of-3 agreement",
                 "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
     direction = "LONG" if sc_l > sc_s else "SHORT"
@@ -521,6 +653,8 @@ def analyze_daily(pair=LIVE_PAIR):
         if fred_dir != direction:
             ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "fred veto")
             LAST_BAR[pair] = bar_date
+            tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — FRED: "
+               f"DEXJPUS 5d {fchg:+.2f}% points {fred_dir}. Signal blocked, no trade.")
             return {"pair": pair, "ok": False, "reason": f"FRED veto ({fchg:+.2f}% vs {direction})",
                     "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
 
@@ -530,6 +664,9 @@ def analyze_daily(pair=LIVE_PAIR):
         if (direction == "LONG" and net < -COT_VETO) or (direction == "SHORT" and net > COT_VETO):
             ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "cot veto")
             LAST_BAR[pair] = bar_date
+            tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — COT: "
+               f"{cfg['future']} specs net {cot['net']:+,.0f} (report {cot.get('report_date','?')}) "
+               f"already crowded against the signal. Blocked, no trade.")
             return {"pair": pair, "ok": False, "reason": f"COT veto ({cfg['future']} net {cot['net']:+,.0f} vs {direction})",
                     "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
 
@@ -550,6 +687,8 @@ def analyze_daily(pair=LIVE_PAIR):
     else:
         sl, tp = price + stop_dist, price - tgt_dist
     LAST_BAR[pair] = bar_date
+    tg(f"🟢 SIGNAL {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — "
+       f"price {price}, SL {fmt_price(pair, sl)}, TP {fmt_price(pair, tp)}. Vetoes clear.")
     return {"pair": pair, "ok": True, "direction": direction, "confidence": round(conf, 1),
             "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
             "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
@@ -725,7 +864,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.2.1")
+app = FastAPI(title="ForexFlow EightFilter", version="3.3.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -738,14 +877,14 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.2.1 started (auto-COT, market names fixed)")
+    logmsg("ForexFlow EightFilter v3.3.0 started (veto evidence + Telegram transparency)")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.2.1", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.3.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
                 "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
     except Exception as e:
@@ -862,7 +1001,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.2.1-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.3.0-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -870,6 +1009,39 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
                             "overlays_not_backfilled": ["F3 volume", "F7 COT", "F8 FRED"],
                             "same_bar_sl_tp": "stop assumed first (conservative)"},
             "results": results, "errors": errors}
+
+@app.get("/backtest/vetoes")
+def backtest_vetoes(risk_usd: float = 1000.0, force_refresh: bool = False):
+    """19-YEAR VETO EVIDENCE: replay the live daily core on all 7 pairs with
+    historical COT + FRED, under 4 variants: core | fred | cot | both.
+    Answers: do the vetoes add EV? which pairs clear PF 1.2?"""
+    refresh_hist(force=force_refresh)
+    results, errors = {}, {}
+    for p in PAIRS:
+        try:
+            candles = get_candles(p, count=5000, gran="D")
+            spread = get_quote(p)["spread"]
+            per_variant = {}
+            for variant in ("core", "fred", "cot", "both"):
+                tr = backtest_daily_veto(p, candles, spread, HIST["cot"], HIST["fred"], variant)
+                per_variant[variant] = grade(tr, risk_usd)
+            results[p] = per_variant
+        except Exception as e:
+            errors[p] = str(e)
+    blend = {}
+    for variant in ("core", "fred", "cot", "both"):
+        all_tr = []
+        for p in PAIRS:
+            if p in errors:
+                continue
+    return {"version": "3.3.0-vetoes", "variants": ["core", "fred", "cot", "both"],
+            "hist_coverage": {"cot": {k: (len(v), v[0][0], v[-1][0]) for k, v in HIST["cot"].items() if v},
+                              "fred": {k: (len(v), v[0][0], v[-1][0]) for k, v in HIST["fred"].items() if v}},
+            "assumptions": {"veto_thresholds": {"fred_pct": MACRO_BLOCK_PCT, "cot_net": COT_VETO},
+                            "spread": "current live, held constant",
+                            "rr": "2:1", "hold_bars_max": 96,
+                            "same_bar_sl_tp": "stop assumed first (conservative)"},
+            "per_pair": results, "errors": errors}
 
 @app.get("/live-check")
 def live_check(days: int = 1000, risk_usd: float = 1000.0):
@@ -900,7 +1072,7 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.2.1", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
+    return {"version": "3.3.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},

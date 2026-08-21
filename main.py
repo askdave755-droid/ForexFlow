@@ -1,39 +1,28 @@
 """
-ForexFlow EightFilter v3.3.0 — "Carry Trend"
-Institutional-style forex signal engine — 7 CME-futures-backed pairs.
+ForexFlow EightFilter v3.4.0 — "Evidence Config"
+Institutional-style forex signal engine — daily trend cores, per-pair vetoes.
+
+v3.4.0 — EVIDENCE CONFIG (from /backtest/vetoes, 19-year backfill):
+  - USD_JPY live with vetoes OFF.
+      Evidence: core-only PF 1.24, +46R (19y). With both vetoes: PF 1.15,
+      +22R — the overlays historically HALVED the edge. Vetoes removed.
+  - EUR_USD added live with COT-only veto.
+      Evidence: core 1.09 -> core+COT PF 1.18, +31R (19y). COT veto is a
+      pair-specific fix for EUR_USD. FRED veto hurt (1.03); excluded.
+  - GBP/AUD/NZD/CAD/CHF stay research-only (losers in all 4 variants).
+  - VETO_MAP is per-pair: {"USD_JPY": set(), "EUR_USD": {"cot"}}
+  - Expected frequency: ~30 trades/yr combined (vs ~10-12 on old config).
 
 v3.3.0 — VETO EVIDENCE + TRANSPARENCY:
-  - /backtest/vetoes: 19-year backfill backtest. Pulls FULL COT history
-    (CFTC Socrata, weekly since ~2006) and FULL FRED daily history, then
-    replays the daily trend core on each of the 7 pairs under 4 variants:
-      core  — price votes only (no overlays)
-      fred  — core + FRED macro veto
-      cot   — core + COT positioning veto
-      both  — core + FRED + COT vetoes (the live config)
-    Answers with data: do the vetoes add EV? Which pairs clear PF 1.2?
-  - Telegram now alerts on EVERY daily decision: trade, veto (which one
-    and why), or pass (no 2-of-3 agreement). Watch it think.
+  - /backtest/vetoes: 19y COT+FRED backfill, 4 variants x 7 pairs.
+  - Telegram alerts on every daily decision (trade / veto / pass).
 
-v3.2.1 hotfix — AUTO-COT market names:
-  - CFTC renamed two CME markets; old names returned stale 2022 rows:
-      6B: "BRITISH POUND STERLING" -> "BRITISH POUND"
-      6N: "NEW ZEALAND DOLLAR"     -> "NZ DOLLAR"
+v3.2.x — AUTO-COT (CFTC Socrata, self-updating, market names fixed).
+v3.1.x — pair-pinned backtests, /live-check, /close path fix.
+v3.0.0 — first evidence-backed live core (USD/JPY daily trend).
 
-v3.2.0 — AUTO-COT:
-  - COT self-updates from CFTC Socrata (no key), 12h throttle, /cot-refresh.
-  - Volume stays manual (no free CME volume API).
-
-v3.1.1 hotfix: /close/{pair} OANDA path /position/ -> /positions/.
-v3.1.0: /backtest/pnl pair param + /live-check pinned to LIVE_PAIR.
-v3.0.0 — evidence-backed live core: USD/JPY DAILY trend
-  (PF 1.30 2007-2016, PF 1.26 2017-2026, 412 trades/19y), >=2 of 3 votes,
-  FRED + COT vetoes, 1% risk, $500 daily lockdown, ledger, Telegram.
-
-Eight filters:
-  F1 VWAP dev | F2 EMA20/50 | F3 CME volume | F4 RSI | F5 session (chop-skip)
-  F6 EV/spread gate | F7 COT | F8 FRED macro
 Risk: 1%/trade, max 3/day, $500 daily loss LOCKDOWN, margin-aware sizing,
-      FIFO-safe, one trade per pair per day.
+      FIFO-safe, one trade per pair per day. Telegram on every decision.
 """
 import os, time, math, threading, logging, sqlite3, json, statistics
 from bisect import bisect_right
@@ -84,7 +73,12 @@ PAIR_MAP = {
 }
 PAIRS = list(PAIR_MAP.keys())
 VOTABLE = 6  # F1,F2,F3,F4,F7,F8 — F5 gates session, F6 gates EV
-LIVE_PAIR = "USD_JPY"          # v3.0: the split-sample survivor
+LIVE_PAIR = "USD_JPY"          # legacy: /live-check pin
+LIVE_PAIRS = ["USD_JPY", "EUR_USD"]   # v3.4 evidence config
+VETO_MAP = {                           # per-pair vetoes, evidence-backed
+    "USD_JPY": set(),                  # vetoes halved the edge (46R -> 22R): OFF
+    "EUR_USD": {"cot"},                # COT veto lifts PF 1.09 -> 1.18: ON
+}
 LAST_BAR = {}                  # pair -> last traded daily-bar date
 COT_VETO = 20000               # net positioning beyond this vs direction = veto
 
@@ -359,7 +353,7 @@ def fetch_cot():
                              params={"market_and_exchange_names": name,
                                      "$order": "report_date_as_yyyy_mm_dd DESC",
                                      "$limit": 1},
-                             headers={"User-Agent": "ForexFlow/3.3 (personal research bot)"},
+                             headers={"User-Agent": "ForexFlow/3.4 (personal research bot)"},
                              timeout=20)
             d = r.json()
             if not isinstance(d, list) or not d:
@@ -396,7 +390,7 @@ def fetch_cot_history():
                                      "$select": "report_date_as_yyyy_mm_dd,noncomm_positions_long_all,noncomm_positions_short_all",
                                      "$order": "report_date_as_yyyy_mm_dd ASC",
                                      "$limit": 50000},
-                             headers={"User-Agent": "ForexFlow/3.3 (personal research bot)"},
+                             headers={"User-Agent": "ForexFlow/3.4 (personal research bot)"},
                              timeout=60)
             rows = r.json()
             if not isinstance(rows, list):
@@ -620,12 +614,13 @@ def analyze_pair(pair):
             "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
             "votes": [(v[0], v[1], v[2]) for v in votes]}
 
-# ---------------- LIVE DAILY CORE (v3.0 — mirrors the proven backtest) ----------------
-def analyze_daily(pair=LIVE_PAIR):
-    """USD/JPY daily trend: >=2 of 3 price votes agree on a NEW daily bar.
-    FRED + COT act as vetoes only (never create a trade).
-    v3.3: every decision (trade / veto / pass) goes to Telegram."""
+# ---------------- LIVE DAILY CORE (evidence config, per-pair vetoes) ----------------
+def analyze_daily(pair):
+    """Daily trend core: >=2 of 3 price votes agree on a NEW daily bar.
+    Vetoes applied per VETO_MAP (evidence-backed, per-pair).
+    Every decision (trade / veto / pass) goes to Telegram."""
     cfg = PAIR_MAP[pair]
+    vetoes = VETO_MAP.get(pair, {"fred", "cot"})   # research pairs default to both
     candles = get_candles(pair, count=60, gran="D")
     if len(candles) < 30:
         return {"pair": pair, "ok": False, "reason": "insufficient daily candles"}
@@ -645,30 +640,32 @@ def analyze_daily(pair=LIVE_PAIR):
     direction = "LONG" if sc_l > sc_s else "SHORT"
     conf = max(sc_l, sc_s) / 3.0 * 100.0
 
-    fchg = FRED.get(pair)
-    if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
-        fred_dir = "LONG" if fchg > 0 else "SHORT"
-        if cfg["fred_up_means"] == "SHORT":
-            fred_dir = "SHORT" if fchg > 0 else "LONG"
-        if fred_dir != direction:
-            ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "fred veto")
-            LAST_BAR[pair] = bar_date
-            tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — FRED: "
-               f"DEXJPUS 5d {fchg:+.2f}% points {fred_dir}. Signal blocked, no trade.")
-            return {"pair": pair, "ok": False, "reason": f"FRED veto ({fchg:+.2f}% vs {direction})",
-                    "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
+    if "fred" in vetoes:
+        fchg = FRED.get(pair)
+        if fchg is not None and abs(fchg) >= MACRO_BLOCK_PCT:
+            fred_dir = "LONG" if fchg > 0 else "SHORT"
+            if cfg["fred_up_means"] == "SHORT":
+                fred_dir = "SHORT" if fchg > 0 else "LONG"
+            if fred_dir != direction:
+                ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "fred veto")
+                LAST_BAR[pair] = bar_date
+                tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — FRED: "
+                   f"{cfg['fred_series']} 5d {fchg:+.2f}% points {fred_dir}. Signal blocked, no trade.")
+                return {"pair": pair, "ok": False, "reason": f"FRED veto ({fchg:+.2f}% vs {direction})",
+                        "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
 
-    cot = COT.get(cfg["future"])
-    if cot is not None:
-        net = -cot["net"] if cfg["cot_invert"] else cot["net"]
-        if (direction == "LONG" and net < -COT_VETO) or (direction == "SHORT" and net > COT_VETO):
-            ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "cot veto")
-            LAST_BAR[pair] = bar_date
-            tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — COT: "
-               f"{cfg['future']} specs net {cot['net']:+,.0f} (report {cot.get('report_date','?')}) "
-               f"already crowded against the signal. Blocked, no trade.")
-            return {"pair": pair, "ok": False, "reason": f"COT veto ({cfg['future']} net {cot['net']:+,.0f} vs {direction})",
-                    "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
+    if "cot" in vetoes:
+        cot = COT.get(cfg["future"])
+        if cot is not None:
+            net = -cot["net"] if cfg["cot_invert"] else cot["net"]
+            if (direction == "LONG" and net < -COT_VETO) or (direction == "SHORT" and net > COT_VETO):
+                ledger_signal(pair, direction, conf, [(v[0], v[1]) for v in votes], False, "cot veto")
+                LAST_BAR[pair] = bar_date
+                tg(f"🚫 VETO {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — COT: "
+                   f"{cfg['future']} specs net {cot['net']:+,.0f} (report {cot.get('report_date','?')}) "
+                   f"already crowded against the signal. Blocked, no trade.")
+                return {"pair": pair, "ok": False, "reason": f"COT veto ({cfg['future']} net {cot['net']:+,.0f} vs {direction})",
+                        "direction": direction, "confidence": round(conf, 1), "bar": bar_date}
 
     a = atr(candles)
     if a <= 0:
@@ -687,8 +684,9 @@ def analyze_daily(pair=LIVE_PAIR):
     else:
         sl, tp = price + stop_dist, price - tgt_dist
     LAST_BAR[pair] = bar_date
+    vt = "+".join(sorted(vetoes)) if vetoes else "none"
     tg(f"🟢 SIGNAL {direction} {pair} ({conf:.0f}% conf, bar {bar_date}) — "
-       f"price {price}, SL {fmt_price(pair, sl)}, TP {fmt_price(pair, tp)}. Vetoes clear.")
+       f"price {price}, SL {fmt_price(pair, sl)}, TP {fmt_price(pair, tp)}. Vetoes: {vt}.")
     return {"pair": pair, "ok": True, "direction": direction, "confidence": round(conf, 1),
             "price": price, "sl": sl, "tp": tp, "stop_dist": stop_dist, "spread": spread,
             "bar": bar_date, "votes": [(v[0], v[1], v[2]) for v in votes]}
@@ -741,14 +739,18 @@ def execute_signal(sig):
 def run_scan():
     reset_daily()
     track_open_trades()
-    try:
-        sig = analyze_daily(LIVE_PAIR)
-        if sig.get("ok"):
-            return [execute_signal(sig)]
-        return [{"pair": LIVE_PAIR, "skipped": sig.get("reason", "?"), "bar": sig.get("bar")}]
-    except Exception as e:
-        logmsg(f"scan error {LIVE_PAIR}: {e}")
-        return [{"pair": LIVE_PAIR, "error": str(e)}]
+    results = []
+    for pair in LIVE_PAIRS:
+        try:
+            sig = analyze_daily(pair)
+            if sig.get("ok"):
+                results.append(execute_signal(sig))
+            else:
+                results.append({"pair": pair, "skipped": sig.get("reason", "?"), "bar": sig.get("bar")})
+        except Exception as e:
+            logmsg(f"scan error {pair}: {e}")
+            results.append({"pair": pair, "error": str(e)})
+    return results
 
 # ---------------- BACKTEST (Kalshi-style /backtest/pnl) ----------------
 def backtest_pair(pair, candles, spread_est, risk_usd=1000.0, core="trend", hold_bars=96,
@@ -864,7 +866,7 @@ def scanner_loop():
         time.sleep(SCAN_INTERVAL)
 
 # ---------------- API ----------------
-app = FastAPI(title="ForexFlow EightFilter", version="3.3.0")
+app = FastAPI(title="ForexFlow EightFilter", version="3.4.0")
 
 class VolumeUpdate(BaseModel):
     future: str
@@ -877,16 +879,17 @@ class CotUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     db()
-    logmsg("ForexFlow EightFilter v3.3.0 started (veto evidence + Telegram transparency)")
+    logmsg(f"ForexFlow EightFilter v3.4.0 started (evidence config: {LIVE_PAIRS})")
     threading.Thread(target=scanner_loop, daemon=True).start()
 
 @app.get("/health")
 def health():
     try:
         acct = get_account()
-        return {"status": "ok", "version": "3.3.0", "env": OANDA_ENV,
+        return {"status": "ok", "version": "3.4.0", "env": OANDA_ENV,
                 "oanda": "connected", "balance": acct["balance"],
-                "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR}
+                "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+                "live_pairs": LIVE_PAIRS, "veto_map": {k: sorted(v) for k, v in VETO_MAP.items()}}
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
@@ -973,7 +976,6 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
     """Replay signal cores over real candles.
     core=trend|invert|revert|all. gran=M15|H1|H4|D.
     pair="" (default) tests all 7 pairs — research/comparison only.
-    pair="USD_JPY" isolates the actual live engine. See /live-check.
     Volume/COT/FRED not backfillable. Spread = current live (constant)."""
     if pair and pair not in PAIR_MAP:
         return {"error": f"unknown pair; valid: {PAIRS}"}
@@ -1001,7 +1003,7 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
             per_pair[p] = grade(tr, risk_usd)
             all_trades.extend(tr)
         results[c] = {"overall": grade(all_trades, risk_usd), "per_pair": per_pair}
-    return {"version": "3.3.0-backtest", "bars_per_pair": bars, "cores": cores,
+    return {"version": "3.4.0-backtest", "bars_per_pair": bars, "cores": cores,
             "pair_filter": pair or "all_7_legacy_blend",
             "assumptions": {"risk_per_trade_usd": risk_usd,
                             "rr": "2:1 trend/invert, 1:1 revert",
@@ -1012,9 +1014,8 @@ def backtest_pnl(days: int = 50, risk_usd: float = 1000.0, core: str = "all",
 
 @app.get("/backtest/vetoes")
 def backtest_vetoes(risk_usd: float = 1000.0, force_refresh: bool = False):
-    """19-YEAR VETO EVIDENCE: replay the live daily core on all 7 pairs with
-    historical COT + FRED, under 4 variants: core | fred | cot | both.
-    Answers: do the vetoes add EV? which pairs clear PF 1.2?"""
+    """19-YEAR VETO EVIDENCE: replay the daily core on all 7 pairs with
+    historical COT + FRED, under 4 variants: core | fred | cot | both."""
     refresh_hist(force=force_refresh)
     results, errors = {}, {}
     for p in PAIRS:
@@ -1028,13 +1029,7 @@ def backtest_vetoes(risk_usd: float = 1000.0, force_refresh: bool = False):
             results[p] = per_variant
         except Exception as e:
             errors[p] = str(e)
-    blend = {}
-    for variant in ("core", "fred", "cot", "both"):
-        all_tr = []
-        for p in PAIRS:
-            if p in errors:
-                continue
-    return {"version": "3.3.0-vetoes", "variants": ["core", "fred", "cot", "both"],
+    return {"version": "3.4.0-vetoes", "variants": ["core", "fred", "cot", "both"],
             "hist_coverage": {"cot": {k: (len(v), v[0][0], v[-1][0]) for k, v in HIST["cot"].items() if v},
                               "fred": {k: (len(v), v[0][0], v[-1][0]) for k, v in HIST["fred"].items() if v}},
             "assumptions": {"veto_thresholds": {"fred_pct": MACRO_BLOCK_PCT, "cot_net": COT_VETO},
@@ -1044,11 +1039,15 @@ def backtest_vetoes(risk_usd: float = 1000.0, force_refresh: bool = False):
             "per_pair": results, "errors": errors}
 
 @app.get("/live-check")
-def live_check(days: int = 1000, risk_usd: float = 1000.0):
-    """Zero-config health check for the ACTUAL live engine: always tests
-    LIVE_PAIR on daily bars with the trend core."""
-    return backtest_pnl(days=days, risk_usd=risk_usd, core="trend",
-                        gran="D", hold_bars=96, pair=LIVE_PAIR)
+def live_check(days: int = 1000, risk_usd: float = 1000.0, pair: str = ""):
+    """Health check for the live engine. pair="" tests both LIVE_PAIRS;
+    pair="USD_JPY" or "EUR_USD" isolates one."""
+    if pair and pair in LIVE_PAIRS:
+        return backtest_pnl(days=days, risk_usd=risk_usd, core="trend",
+                            gran="D", hold_bars=96, pair=pair)
+    return {p: backtest_pnl(days=days, risk_usd=risk_usd, core="trend",
+                            gran="D", hold_bars=96, pair=p)["results"]["trend"]["overall"]
+            for p in LIVE_PAIRS}
 
 @app.post("/close/{pair}")
 def close_position(pair: str):
@@ -1072,7 +1071,8 @@ def logs():
 @app.get("/dashboard")
 def dashboard():
     reset_daily()
-    return {"version": "3.3.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS, "live_pair": LIVE_PAIR,
+    return {"version": "3.4.0", "auto_trade": AUTO_TRADE, "pairs": PAIRS,
+            "live_pairs": LIVE_PAIRS, "veto_map": {k: sorted(v) for k, v in VETO_MAP.items()},
             "daily": {"date": DAILY["date"], "trades": DAILY["trades"],
                       "pnl": round(daily_pnl(), 2), "lockdown": DAILY["lockdown"],
                       "traded_pairs": DAILY["traded_pairs"]},
